@@ -1,0 +1,19 @@
+[package]
+name = "radii-crawl"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Radii discovery and reachability compartment"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+radii-core = { path = "../core" }
+radii-proto = { path = "../proto" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+toml = "0.8"
+tracing = "0.1"

@@ -1,0 +1,13 @@
+[http]
+bind = "0.0.0.0:8080"
+
+[radii]
+bind = "0.0.0.0:7000"
+crawl_upstream = "127.0.0.1:7100"
+
+[routing]
+default_backend = "http://127.0.0.1:9000"
+
+[routing.host_map]
+"example.com" = "http://10.0.0.10:9000"
+"static.example.com" = "http://10.0.0.11:9000"

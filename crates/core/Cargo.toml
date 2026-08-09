@@ -1,0 +1,17 @@
+[package]
+name = "radii-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared types, routing, and utilities for Radii"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

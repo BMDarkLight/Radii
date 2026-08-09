@@ -1,0 +1,15 @@
+[package]
+name = "radii-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Radii wire protocol messages and framing"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["io-util"] }
