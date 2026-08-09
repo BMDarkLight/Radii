@@ -5,6 +5,7 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,23 +21,30 @@ struct HeadResponse {
     decision_reason: String,
 }
 
-pub async fn serve_http(bind: &str, decision: DecisionEngine) -> anyhow::Result<()> {
-    let addr: SocketAddr = bind.parse()?;
-    tracing::info!(%addr, "head http listening");
-
+pub fn router(decision: DecisionEngine) -> Router {
     let state = AppState {
         decision,
         protocol: Protocol::Http,
     };
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health))
         .fallback(any(handle_request))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn serve_http(bind: &str, decision: DecisionEngine) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(bind).await?;
+    serve_http_on(listener, decision).await
+}
+
+pub async fn serve_http_on(listener: TcpListener, decision: DecisionEngine) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
+    tracing::info!(%addr, "head http listening");
 
     axum::serve(
-        tokio::net::TcpListener::bind(addr).await?,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        listener,
+        router(decision).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
 

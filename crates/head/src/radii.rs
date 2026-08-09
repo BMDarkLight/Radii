@@ -9,10 +9,13 @@ pub async fn maybe_run_radii(config: &Option<RadiiConfig>) -> anyhow::Result<()>
 
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!(bind = %config.bind, upstream = %config.crawl_upstream, "head radii listening");
+    run_radii_on(listener, config.crawl_upstream.clone()).await
+}
 
+pub async fn run_radii_on(listener: TcpListener, crawl_upstream: String) -> anyhow::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
-        let upstream = config.crawl_upstream.clone();
+        let upstream = crawl_upstream.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, upstream, addr).await {
                 tracing::warn!(source = %addr, error = %err, "radii connection failed");

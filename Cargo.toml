@@ -7,4 +7,5 @@ members = [
   "crates/crawl",
   "crates/fetch",
   "crates/cli",
+  "crates/integration",
 ]

@@ -1,0 +1,22 @@
+[package]
+name = "radii-integration"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Cross-crate integration tests for Radii"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+radii-core = { path = "../core" }
+radii-crawl = { path = "../crawl" }
+radii-fetch = { path = "../fetch" }
+radii-head = { path = "../head" }
+radii-proto = { path = "../proto" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tracing = "0.1"

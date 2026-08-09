@@ -13,3 +13,6 @@ anyhow = "1"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }

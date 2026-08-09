@@ -295,4 +295,63 @@ mod tests {
 
         assert!(planner.plan(&snapshot, &request, 1).is_empty());
     }
+
+    #[test]
+    fn filters_disallowed_protocols() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("a", "b", "ssh", 10),
+            report("a", "b", "radii", 50),
+        ]);
+        let planner = RoutePlanner::new(DefaultScorer);
+        let request = RouteRequest {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            allowed_protocols: vec![ProtocolId::new("radii")],
+            max_hops: 2,
+        };
+        let routes = planner.plan(&snapshot, &request, 4);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].protocol, ProtocolId::new("radii"));
+    }
+
+    #[test]
+    fn respects_max_hops() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("a", "b", "radii", 10),
+            report("b", "c", "radii", 10),
+            report("c", "d", "radii", 10),
+        ]);
+        let planner = RoutePlanner::new(DefaultScorer);
+        let request = RouteRequest {
+            source: NodeId("a".into()),
+            target: NodeId("d".into()),
+            allowed_protocols: vec![ProtocolId::new("radii")],
+            max_hops: 2,
+        };
+        assert!(planner.plan(&snapshot, &request, 1).is_empty());
+    }
+
+    #[test]
+    fn avoids_cycles() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("a", "b", "radii", 10),
+            report("b", "a", "radii", 10),
+            report("b", "c", "radii", 10),
+        ]);
+        let planner = RoutePlanner::new(DefaultScorer);
+        let request = RouteRequest {
+            source: NodeId("a".into()),
+            target: NodeId("c".into()),
+            allowed_protocols: vec![ProtocolId::new("radii")],
+            max_hops: 8,
+        };
+        let routes = planner.plan(&snapshot, &request, 3);
+        assert!(!routes.is_empty());
+        for route in routes {
+            let mut seen = HashSet::new();
+            for hop in &route.hops {
+                assert!(seen.insert(hop.clone()), "cycle in {:?}", route.hops);
+            }
+        }
+    }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CrawlState {
     pub nodes: HashMap<String, Vec<String>>,
     pub reachability: Vec<RadiiMessage>,
@@ -14,8 +14,18 @@ pub struct CrawlState {
 pub async fn run(bind: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "crawl listening");
-    let state = Arc::new(RwLock::new(CrawlState::default()));
+    run_on(listener).await
+}
 
+pub async fn run_on(listener: TcpListener) -> anyhow::Result<()> {
+    let state = Arc::new(RwLock::new(CrawlState::default()));
+    run_on_with_state(listener, state).await
+}
+
+pub async fn run_on_with_state(
+    listener: TcpListener,
+    state: Arc<RwLock<CrawlState>>,
+) -> anyhow::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let state = Arc::clone(&state);

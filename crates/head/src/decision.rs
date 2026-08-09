@@ -116,3 +116,45 @@ impl DecisionPolicy for DefaultPolicy {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RoutingConfig;
+
+    fn input(host: Option<&str>) -> DecisionInput<'_> {
+        DecisionInput {
+            protocol: Protocol::Http,
+            protocol_label: None,
+            host,
+            source: None,
+            destination_port: None,
+            attributes: &[],
+        }
+    }
+
+    #[test]
+    fn prefers_host_map_over_default() {
+        let mut host_map = HashMap::new();
+        host_map.insert("example.com".into(), "http://10.0.0.10:9000".into());
+        let engine = DecisionEngine::from_config(&RoutingConfig {
+            default_backend: "http://127.0.0.1:9000".into(),
+            host_map,
+        });
+
+        let matched = engine.decide(input(Some("example.com")));
+        assert_eq!(matched.backend, "http://10.0.0.10:9000");
+        assert!(matches!(matched.reason, DecisionReason::HostMatch));
+
+        let fallback = engine.decide(input(Some("other.example")));
+        assert_eq!(fallback.backend, "http://127.0.0.1:9000");
+        assert!(matches!(fallback.reason, DecisionReason::Default));
+    }
+
+    #[test]
+    fn empty_engine_returns_unreachable() {
+        let engine = DecisionEngine::new();
+        let decision = engine.decide(input(None));
+        assert_eq!(decision.backend, "unreachable");
+    }
+}

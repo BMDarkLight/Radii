@@ -2,7 +2,7 @@
 
 A runtime for header-less content delivery. Radii routes traffic over dedicated infrastructure or P2P mesh paths so services stay reachable despite IP churn, NAT, and partial network failure.
 
-**Status:** early foundation — not production-ready. The workspace ships the three-compartment architecture and a minimal working path (discovery, decision, tunnel).
+**Status:** early foundation — not production-ready. The workspace ships the three-compartment architecture and a minimal working path (discovery, decision, tunnel). Read [`SECURITY.md`](SECURITY.md) before exposing any listener.
 
 ## Why Radii
 
@@ -129,6 +129,10 @@ Per-compartment detail lives in:
 ## Contributing
 
 This project is early. Open an issue for proposed protocol or architecture changes before large experiments.
+
+## Security
+
+Radii is a network-facing project. See [`SECURITY.md`](SECURITY.md) for the threat model, known gaps, deployment checklist, and vulnerability reporting process. Do not expose Crawl / Radii / Fetch listeners to untrusted networks without additional controls.
 
 ## License
 

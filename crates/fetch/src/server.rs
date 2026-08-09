@@ -4,7 +4,10 @@ use tokio::net::{TcpListener, TcpStream};
 pub async fn run(bind: &str, upstream: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, %upstream, "fetch tunnel listening");
+    run_on(listener, upstream).await
+}
 
+pub async fn run_on(listener: TcpListener, upstream: &str) -> anyhow::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let upstream = upstream.to_string();
@@ -38,7 +41,8 @@ async fn handle_connection(
     Ok(())
 }
 
-fn normalize_upstream(upstream: &str) -> String {
+/// Normalize configured upstream addresses by stripping known URL-style prefixes.
+pub fn normalize_upstream(upstream: &str) -> String {
     let trimmed = upstream.trim();
     if let Some(stripped) = trimmed.strip_prefix("ssh://") {
         return stripped.to_string();
@@ -47,4 +51,16 @@ fn normalize_upstream(upstream: &str) -> String {
         return stripped.to_string();
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_upstream;
+
+    #[test]
+    fn strips_known_prefixes_and_whitespace() {
+        assert_eq!(normalize_upstream("  ssh://127.0.0.1:22 "), "127.0.0.1:22");
+        assert_eq!(normalize_upstream("tcp://10.0.0.1:443"), "10.0.0.1:443");
+        assert_eq!(normalize_upstream("127.0.0.1:9000"), "127.0.0.1:9000");
+    }
 }
