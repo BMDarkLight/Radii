@@ -2,6 +2,7 @@
 name = "radii-fetch"
 version = "0.1.0"
 edition = "2021"
+publish = false
 license = "MIT"
 description = "Radii routing and delivery compartment"
 

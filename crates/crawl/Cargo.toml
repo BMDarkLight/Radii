@@ -2,6 +2,7 @@
 name = "radii-crawl"
 version = "0.1.0"
 edition = "2021"
+publish = false
 license = "MIT"
 description = "Radii discovery and reachability compartment"
 

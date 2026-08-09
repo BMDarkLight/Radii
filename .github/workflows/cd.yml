@@ -1,0 +1,138 @@
+name: CD
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - os: ubuntu-latest
+            target: riscv64gc-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cd-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binaries (native)
+        if: matrix.cross != true
+        run: >
+          cargo build --release --locked
+          --target ${{ matrix.target }}
+          -p radii-crawl -p radii-head -p radii-fetch -p radii-cli
+
+      - name: Build release binaries (cross)
+        if: matrix.cross == true
+        run: >
+          cross build --release --locked
+          --target ${{ matrix.target }}
+          -p radii-crawl -p radii-head -p radii-fetch -p radii-cli
+
+      - name: Stage artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="dist/radii-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          cp "$BIN_DIR/radii" "$BIN_DIR/radii-crawl" "$BIN_DIR/radii-head" "$BIN_DIR/radii-fetch" "$STAGE/"
+          cp README.md LICENSE SECURITY.md "$STAGE/"
+          cp crates/crawl/crawl.example.toml crates/head/head.example.toml crates/fetch/fetch.example.toml "$STAGE/"
+          (
+            cd dist
+            tar -czf "radii-${{ matrix.target }}.tar.gz" "radii-${{ matrix.target }}"
+          )
+          ls -la dist/
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "dist/radii-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $binDir = "target/${{ matrix.target }}/release"
+          Copy-Item "$binDir/radii.exe","$binDir/radii-crawl.exe","$binDir/radii-head.exe","$binDir/radii-fetch.exe" $stage
+          Copy-Item README.md,LICENSE,SECURITY.md $stage
+          Copy-Item crates/crawl/crawl.example.toml,crates/head/head.example.toml,crates/fetch/fetch.example.toml $stage
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $stage -DestinationPath "dist/radii-${{ matrix.target }}.zip" -Force
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: radii-${{ matrix.target }}
+          path: dist/radii-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+  summarize:
+    name: CD summary
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: radii-*
+          merge-multiple: false
+
+      - name: List built packages
+        run: |
+          echo "Built Radii packages:"
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec ls -lh {} \;

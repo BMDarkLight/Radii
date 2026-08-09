@@ -40,7 +40,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &RadiiMessage,
 ) -> Result<()> {
-    let payload = bincode::serialize(message)?;
+    let payload = postcard::to_allocvec(message)?;
     let len = u32::try_from(payload.len()).map_err(|_| anyhow::anyhow!("frame too large"))?;
     if len > MAX_FRAME_LEN {
         bail!("frame length {len} exceeds max {MAX_FRAME_LEN}");
@@ -59,7 +59,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
     }
     let mut payload = vec![0u8; len as usize];
     reader.read_exact(&mut payload).await?;
-    let message = bincode::deserialize(&payload)?;
+    let message = postcard::from_bytes(&payload)?;
     Ok(message)
 }
 
@@ -141,7 +141,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_garbage_payload() {
         let (mut client, mut server): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
-        let garbage = [0u8; 16];
+        // Incomplete varint / truncated postcard payload should fail to decode.
+        let garbage = [0xffu8; 16];
         client
             .write_all(&(garbage.len() as u32).to_be_bytes())
             .await

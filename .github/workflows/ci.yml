@@ -84,7 +84,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --all-features
+          # Must set explicitly: action default is `--all-features`, which pulls
+          # unused optional deps (e.g. postcard/heapless → atomic-polyfill).
+          arguments: --config ./deny.toml
 
   docs:
     name: Docs

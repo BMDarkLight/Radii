@@ -63,7 +63,7 @@ crates/
   cli/      operator probe + offline planner (`radii`)
 ```
 
-Stack: Rust 2021, tokio, axum (Head), clap, serde/toml, tracing, bincode.
+Stack: Rust 2021, tokio, axum (Head), clap, serde/toml, tracing, postcard.
 
 ## Build
 
@@ -71,6 +71,8 @@ Stack: Rust 2021, tokio, axum (Head), clap, serde/toml, tracing, bincode.
 cargo build --workspace
 cargo test --workspace
 ```
+
+Release binaries for Linux (x86_64, aarch64, riscv64), macOS, and Windows (x86_64 and aarch64) are built by the [CD workflow](.github/workflows/cd.yml) on `main` / version tags and uploaded as GitHub Actions artifacts (`radii-<target>`).
 
 ## Quick start
 
