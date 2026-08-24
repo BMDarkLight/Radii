@@ -928,6 +928,7 @@ dependencies = [
  "anyhow",
  "clap",
  "radii-core",
+ "radii-proto",
  "serde",
  "tempfile",
  "tokio",

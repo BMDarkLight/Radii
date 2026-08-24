@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, ToSocketAddrs};
 
 /// Maximum accepted Radii frame payload size (1 MiB).
 ///
@@ -69,6 +70,19 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&payload).await?;
     Ok(())
+}
+
+/// Opens a fresh connection to a Crawl (or Crawl-speaking) listener, sends a
+/// `GraphQuery`, and returns the node registry and reachability reports from
+/// its `GraphSnapshot` reply. Shared by any compartment that needs to resolve
+/// live topology (Head's decision engine, Fetch's path selection, ...).
+pub async fn query_graph<A: ToSocketAddrs>(addr: A) -> Result<(Vec<NodeInfo>, Vec<GraphReport>)> {
+    let mut stream = TcpStream::connect(addr).await?;
+    write_message(&mut stream, &RadiiMessage::GraphQuery).await?;
+    match read_message(&mut stream).await? {
+        RadiiMessage::GraphSnapshot { nodes, reports } => Ok((nodes, reports)),
+        other => bail!("unexpected reply to graph query: {other:?}"),
+    }
 }
 
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiMessage> {

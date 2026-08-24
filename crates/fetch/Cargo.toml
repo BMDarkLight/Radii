@@ -13,11 +13,13 @@ path = "src/lib.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 radii-core = { path = "../core" }
+radii-proto = { path = "../proto" }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 toml = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+radii-proto = { path = "../proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

@@ -2,11 +2,9 @@ use crate::config::GraphConfig;
 use radii_core::routing::{
     DefaultScorer, GraphSnapshot, Link, NodeId, ProtocolId, RoutePlanner, RouteRequest,
 };
-use radii_proto::{read_message, write_message, RadiiMessage};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 /// Live view of Crawl's reachability graph plus the node listen-address
 /// registry, refreshed on an interval by [`run_poll`].
@@ -43,28 +41,23 @@ pub async fn run_poll(config: GraphConfig, state: SharedGraphState) -> anyhow::R
 async fn fetch_once(
     crawl_upstream: &str,
 ) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<String>>)> {
-    let mut stream = TcpStream::connect(crawl_upstream).await?;
-    write_message(&mut stream, &RadiiMessage::GraphQuery).await?;
-    match read_message(&mut stream).await? {
-        RadiiMessage::GraphSnapshot { nodes, reports } => {
-            let mut snapshot = GraphSnapshot::new();
-            for report in reports {
-                snapshot.add_link(Link {
-                    from: NodeId(report.from),
-                    to: NodeId(report.target),
-                    protocol: ProtocolId::new(report.protocol),
-                    reachable: report.reachable,
-                    latency_ms: report.rtt_ms,
-                });
-            }
-            let listen_addrs = nodes
-                .into_iter()
-                .map(|node| (node.node_id, node.listen_addrs))
-                .collect();
-            Ok((snapshot, listen_addrs))
-        }
-        other => anyhow::bail!("unexpected reply to graph query: {other:?}"),
+    let (nodes, reports) = radii_proto::query_graph(crawl_upstream).await?;
+
+    let mut snapshot = GraphSnapshot::new();
+    for report in reports {
+        snapshot.add_link(Link {
+            from: NodeId(report.from),
+            to: NodeId(report.target),
+            protocol: ProtocolId::new(report.protocol),
+            reachable: report.reachable,
+            latency_ms: report.rtt_ms,
+        });
     }
+    let listen_addrs = nodes
+        .into_iter()
+        .map(|node| (node.node_id, node.listen_addrs))
+        .collect();
+    Ok((snapshot, listen_addrs))
 }
 
 /// Finds the best-scoring reachable route from `source` to `target` in the

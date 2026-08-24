@@ -21,7 +21,6 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
 ## Next
 
 - Reverse-proxy HTTP to the selected backend
-- Fetch consuming the same graph for path selection (today only Head does)
 - Authenticated control-plane surface
 - Live config reload
 - HTTPS / SSH / DNS surfaces (deferred until the HTTP path is solid)

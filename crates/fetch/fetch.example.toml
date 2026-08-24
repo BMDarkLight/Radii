@@ -1,2 +1,13 @@
 bind = "0.0.0.0:2223"
 upstream = "127.0.0.1:22"
+
+# Optional: resolve the upstream from Crawl's live reachability graph instead
+# of the static `upstream` above, which becomes the fallback used when no
+# reachable route to target_node_id exists yet.
+[graph]
+crawl_upstream = "127.0.0.1:7100"
+source_node_id = "fetch"
+target_node_id = "node-b"
+poll_interval_ms = 5000
+allowed_protocols = ["ssh"]
+max_hops = 4

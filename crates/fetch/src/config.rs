@@ -6,6 +6,36 @@ use std::path::Path;
 pub struct Config {
     pub bind: String,
     pub upstream: String,
+    pub graph: Option<GraphConfig>,
+}
+
+/// Configures Fetch to resolve its upstream from Crawl's live reachability
+/// graph instead of the static `upstream` above. `upstream` remains the
+/// fallback used when no reachable route to `target_node_id` exists yet.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GraphConfig {
+    pub crawl_upstream: String,
+    #[serde(default = "default_source_node_id")]
+    pub source_node_id: String,
+    pub target_node_id: String,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default)]
+    pub allowed_protocols: Vec<String>,
+    #[serde(default = "default_max_hops")]
+    pub max_hops: usize,
+}
+
+fn default_source_node_id() -> String {
+    "fetch".to_string()
+}
+
+fn default_poll_interval_ms() -> u64 {
+    5000
+}
+
+fn default_max_hops() -> usize {
+    4
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {

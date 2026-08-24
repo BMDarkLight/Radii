@@ -1,5 +1,5 @@
 use clap::Parser;
-use radii_fetch::{config, server};
+use radii_fetch::config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -14,5 +14,5 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let config = config::load(&args.config)?;
-    server::run(&config.bind, &config.upstream).await
+    radii_fetch::run(config).await
 }

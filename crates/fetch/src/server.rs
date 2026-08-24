@@ -1,3 +1,4 @@
+use crate::graph::SharedTarget;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -11,6 +12,29 @@ pub async fn run_on(listener: TcpListener, upstream: &str) -> anyhow::Result<()>
     loop {
         let (stream, addr) = listener.accept().await?;
         let upstream = upstream.to_string();
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection(stream, addr, &upstream).await {
+                tracing::warn!(source = %addr, error = %err, "fetch tunnel failed");
+            }
+        });
+    }
+}
+
+/// Like [`run_on`], but resolves the upstream for each new connection from a
+/// live-updated graph target, falling back to `static_upstream` when no
+/// graph-resolved route is available yet.
+pub async fn run_on_dynamic(
+    listener: TcpListener,
+    static_upstream: String,
+    target: SharedTarget,
+) -> anyhow::Result<()> {
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        let upstream = target
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| static_upstream.clone());
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, addr, &upstream).await {
                 tracing::warn!(source = %addr, error = %err, "fetch tunnel failed");

@@ -14,7 +14,7 @@ anyhow = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "net"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }
