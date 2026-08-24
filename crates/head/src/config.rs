@@ -8,6 +8,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub radii: Option<RadiiConfig>,
     pub routing: RoutingConfig,
+    pub graph: Option<GraphConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +27,36 @@ pub struct RoutingConfig {
     pub default_backend: String,
     #[serde(default)]
     pub host_map: HashMap<String, String>,
+}
+
+/// Configures Head to resolve backends from Crawl's live reachability graph
+/// instead of (or ahead of) the static `routing.host_map`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GraphConfig {
+    pub crawl_upstream: String,
+    #[serde(default = "default_source_node_id")]
+    pub source_node_id: String,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default)]
+    pub allowed_protocols: Vec<String>,
+    #[serde(default = "default_max_hops")]
+    pub max_hops: usize,
+    /// Maps an inbound HTTP host to the Crawl node id that should serve it.
+    #[serde(default)]
+    pub node_map: HashMap<String, String>,
+}
+
+fn default_source_node_id() -> String {
+    "head".to_string()
+}
+
+fn default_poll_interval_ms() -> u64 {
+    5000
+}
+
+fn default_max_hops() -> usize {
+    4
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {

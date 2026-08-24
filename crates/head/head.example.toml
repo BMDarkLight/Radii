@@ -11,3 +11,16 @@ default_backend = "http://127.0.0.1:9000"
 [routing.host_map]
 "example.com" = "http://10.0.0.10:9000"
 "static.example.com" = "http://10.0.0.11:9000"
+
+# Optional: resolve backends from Crawl's live reachability graph instead of
+# (ahead of) the static host_map above. Falls through to host_map/default
+# when a host isn't in node_map or no reachable route currently exists.
+[graph]
+crawl_upstream = "127.0.0.1:7100"
+source_node_id = "head"
+poll_interval_ms = 5000
+allowed_protocols = ["http"]
+max_hops = 4
+
+[graph.node_map]
+"example.com" = "node-b"

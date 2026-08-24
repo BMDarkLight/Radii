@@ -1,4 +1,4 @@
-use radii_proto::{read_message, write_message, RadiiMessage};
+use radii_proto::{read_message, write_message, GraphReport, NodeInfo, RadiiMessage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -115,6 +115,44 @@ async fn handle_connection(
                     },
                 )
                 .await?;
+            }
+            RadiiMessage::GraphQuery => {
+                let guard = state.read().await;
+                let nodes = guard
+                    .nodes
+                    .iter()
+                    .map(|(node_id, listen_addrs)| NodeInfo {
+                        node_id: node_id.clone(),
+                        listen_addrs: listen_addrs.clone(),
+                    })
+                    .collect();
+                let reports = guard
+                    .reachability
+                    .iter()
+                    .filter_map(|message| match message {
+                        RadiiMessage::ReachabilityReport {
+                            from,
+                            target,
+                            protocol,
+                            reachable,
+                            rtt_ms,
+                            ..
+                        } => Some(GraphReport {
+                            from: from.clone(),
+                            target: target.clone(),
+                            protocol: protocol.clone(),
+                            reachable: *reachable,
+                            rtt_ms: *rtt_ms,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                drop(guard);
+                tracing::info!(source = %addr, "crawl graph query");
+                write_message(&mut stream, &RadiiMessage::GraphSnapshot { nodes, reports }).await?;
+            }
+            RadiiMessage::GraphSnapshot { .. } => {
+                tracing::info!(source = %addr, "crawl received unexpected graph snapshot");
             }
             RadiiMessage::Ack { .. } => {
                 tracing::info!(source = %addr, "crawl ack");

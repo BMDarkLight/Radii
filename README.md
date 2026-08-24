@@ -107,7 +107,7 @@ printf '%s\n' \
 ## What works today
 
 - **Crawl:** accepts `NodeHello`, probes, and reports over the Radii TCP protocol; keeps an in-memory view; acknowledges messages.
-- **Head:** HTTP `/health`; other paths return a JSON backend decision (host map + default); optional Radii listener that forwards to Crawl.
+- **Head:** HTTP `/health`; other paths return a JSON backend decision — resolved from Crawl's live reachability graph when configured, falling back to a host map, then a default; optional Radii listener that forwards to Crawl.
 - **Fetch:** TCP tunnel from `bind` to `upstream` (`ssh://` / `tcp://` prefixes stripped).
 - **core/cli:** graph snapshot + route planner; CLI hello/report/plan.
 

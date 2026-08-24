@@ -1,5 +1,6 @@
-use crate::{config, decision::DecisionEngine, http, radii};
+use crate::{config, decision::DecisionEngine, graph, http, radii};
 use radii_core::registry::{BoxFuture, ProtocolRunner};
+use std::sync::Arc;
 
 pub struct HttpRunner {
     bind: String,
@@ -42,5 +43,33 @@ impl ProtocolRunner for RadiiRunner {
     fn start(&self) -> BoxFuture<'_> {
         let config = self.config.clone();
         Box::pin(async move { radii::maybe_run_radii(&config).await })
+    }
+}
+
+pub struct GraphPollRunner {
+    config: Option<config::GraphConfig>,
+    state: graph::SharedGraphState,
+}
+
+impl GraphPollRunner {
+    pub fn maybe_new(config: Option<config::GraphConfig>, state: graph::SharedGraphState) -> Self {
+        Self { config, state }
+    }
+}
+
+impl ProtocolRunner for GraphPollRunner {
+    fn name(&self) -> &'static str {
+        "graph"
+    }
+
+    fn start(&self) -> BoxFuture<'_> {
+        let config = self.config.clone();
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let Some(config) = config else {
+                return Ok(());
+            };
+            graph::run_poll(config, state).await
+        })
     }
 }

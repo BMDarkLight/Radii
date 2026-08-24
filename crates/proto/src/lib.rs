@@ -31,9 +31,30 @@ pub enum RadiiMessage {
         source: String,
         message: Box<RadiiMessage>,
     },
+    /// Requests the current node registry and reachability graph from Crawl.
+    GraphQuery,
+    GraphSnapshot {
+        nodes: Vec<NodeInfo>,
+        reports: Vec<GraphReport>,
+    },
     Ack {
         status: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub listen_addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphReport {
+    pub from: String,
+    pub target: String,
+    pub protocol: String,
+    pub reachable: bool,
+    pub rtt_ms: Option<u32>,
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -115,6 +136,29 @@ mod tests {
             }),
         };
         assert_eq!(round_trip(wrapped.clone()).await, wrapped);
+    }
+
+    #[tokio::test]
+    async fn round_trips_graph_query_and_snapshot() {
+        assert_eq!(
+            round_trip(RadiiMessage::GraphQuery).await,
+            RadiiMessage::GraphQuery
+        );
+
+        let snapshot = RadiiMessage::GraphSnapshot {
+            nodes: vec![NodeInfo {
+                node_id: "node-a".into(),
+                listen_addrs: vec!["127.0.0.1:9000".into()],
+            }],
+            reports: vec![GraphReport {
+                from: "node-a".into(),
+                target: "node-b".into(),
+                protocol: "radii".into(),
+                reachable: true,
+                rtt_ms: Some(12),
+            }],
+        };
+        assert_eq!(round_trip(snapshot.clone()).await, snapshot);
     }
 
     #[tokio::test]

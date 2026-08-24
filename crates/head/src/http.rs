@@ -79,6 +79,7 @@ async fn handle_request(
     );
 
     let reason = match decision.reason {
+        DecisionReason::GraphRoute => "graph_route",
         DecisionReason::HostMatch => "host_map",
         DecisionReason::Default => "default",
     };

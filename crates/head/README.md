@@ -1,6 +1,6 @@
 # radii-head
 
-Head is the public access plane. It accepts inbound HTTP, decides a backend from a host map (or default), and can bridge Radii protocol traffic to Crawl.
+Head is the public access plane. It accepts inbound HTTP, decides a backend from Crawl's live reachability graph (falling back to a static host map, then a default), and can bridge Radii protocol traffic to Crawl.
 
 ## Run
 
@@ -12,12 +12,16 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
 
 - HTTP listener with `GET /health`
 - Catch-all handler returns JSON: source IP, host, chosen backend, decision reason
-- Host-map + default decision engine
+- Decision engine, in priority order:
+  1. **Graph route** (optional, `[graph]` config) — polls Crawl for its reachability graph on an interval and plans a route from Head's `source_node_id` to the node mapped to the request host in `node_map`; resolves to that node's registered listen address. Falls through if the host isn't mapped or no reachable route exists.
+  2. **Host map** — static `routing.host_map` lookup.
+  3. **Default** — `routing.default_backend`.
 - Optional Radii TCP bridge that wraps inbound messages as `FromHead` and forwards to Crawl
 
 ## Next
 
 - Reverse-proxy HTTP to the selected backend
+- Fetch consuming the same graph for path selection (today only Head does)
 - Authenticated control-plane surface
 - Live config reload
 - HTTPS / SSH / DNS surfaces (deferred until the HTTP path is solid)
