@@ -14,10 +14,9 @@ use crate::BoxedStream;
 use anyhow::{bail, Context, Result};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::Deserialize;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use tokio::net::TcpStream;
@@ -103,10 +102,8 @@ fn build_root_store(ca_certs: &[CertificateDer<'static>]) -> Result<RootCertStor
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("opening cert file {}", path.display()))?,
-    );
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("opening cert file {}", path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("parsing cert file {}", path.display()))?;
     if certs.is_empty() {
@@ -116,12 +113,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("opening key file {}", path.display()))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("parsing key file {}", path.display()))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
+    PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("parsing key file {}", path.display()))
 }
 
 /// Builds the TLS `ServerName` rustls needs to verify a peer's certificate
@@ -194,6 +187,7 @@ fn client_identity(stream: &TlsServerStream) -> Result<String> {
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType};
+    use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
