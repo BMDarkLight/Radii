@@ -1,9 +1,10 @@
 name: CD
 
+# Disabled from automatic triggers for now — the project isn't at a release
+# stage yet and this multi-target build was getting stuck/wasting CI time on
+# every push. Kept available via workflow_dispatch for manual runs; restore
+# the push/tags triggers below once release builds are actually wanted.
 on:
-  push:
-    branches: [main, master]
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:

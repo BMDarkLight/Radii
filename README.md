@@ -74,7 +74,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Release binaries for Linux (x86_64, aarch64, riscv64), macOS, and Windows (x86_64 and aarch64) are built by the [CD workflow](.github/workflows/cd.yml) on `main` / version tags and uploaded as GitHub Actions artifacts (`radii-<target>`).
+Release binaries for Linux (x86_64, aarch64, riscv64), macOS, and Windows (x86_64 and aarch64) can be built via the [CD workflow](.github/workflows/cd.yml) (`radii-<target>` artifacts). It's currently manual-only (`workflow_dispatch`) — the project isn't at a release stage yet — rather than triggered automatically on `main` / version tags.
 
 ## Quick start
 
