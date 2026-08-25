@@ -48,7 +48,7 @@ async fn bridge_reuses_one_upstream_session_across_messages() {
     let (head_listener, head_addr) = bind_local().await.unwrap();
     let crawl_upstream = crawl_addr.clone();
     let head_handle =
-        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream).await });
+        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream, None).await });
     wait_ready(&head_addr).await.unwrap();
 
     let mut stream = TcpStream::connect(&head_addr).await.unwrap();
@@ -109,7 +109,7 @@ async fn bridge_reconnects_after_upstream_drop() {
     let (head_listener, head_addr) = bind_local().await.unwrap();
     let crawl_upstream = crawl_addr.clone();
     let head_handle =
-        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream).await });
+        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream, None).await });
     wait_ready(&head_addr).await.unwrap();
 
     let mut stream = TcpStream::connect(&head_addr).await.unwrap();

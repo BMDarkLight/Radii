@@ -43,7 +43,7 @@ Conceptual flow:
 - Resilience under churn, NAT, and partial outages
 - Observability of reachability and route health
 - Low-dependency operation on diverse hosts
-- Authenticated peers and authorized routes (early model)
+- Authenticated peers and authorized routes — opt-in mutual TLS ships (see [`docs/tls.md`](docs/tls.md)); not yet mandatory by default
 
 ## Non-goals (for now)
 
@@ -56,11 +56,13 @@ Conceptual flow:
 ```
 crates/
   core/     shared graph/routing types, logging, protocol registry
-  proto/    RadiiMessage + length-prefixed framing
+  proto/    RadiiMessage + length-prefixed framing + mutual TLS
   crawl/    discovery listener
   head/     HTTP entry + decision engine + Radii→Crawl bridge
   fetch/    TCP tunnel delivery
   cli/      operator probe + offline planner (`radii`)
+docs/       operational docs (mutual TLS setup, key lifecycle)
+scripts/    dev tooling (throwaway cert generation for local TLS testing)
 ```
 
 Stack: Rust 2021, tokio, axum (Head), clap, serde/toml, tracing, postcard.
@@ -95,6 +97,8 @@ cargo run -p radii-cli -- report --addr 127.0.0.1:7100 \
   --from node-a --target node-b --protocol radii --reachable true --rtt-ms 42
 ```
 
+Against a `[tls]`-enabled Crawl/Head, add `--tls-cert`, `--tls-key`, and `--tls-ca` to `hello`/`report` — see [`docs/tls.md`](docs/tls.md).
+
 Plan routes from JSONL reports on stdin:
 
 ```bash
@@ -110,6 +114,7 @@ printf '%s\n' \
 - **Head:** HTTP `/health`; other paths return a JSON backend decision — resolved from Crawl's live reachability graph when configured, falling back to a host map, then a default; optional Radii listener that forwards to Crawl.
 - **Fetch:** TCP tunnel from `bind` to an upstream — resolved live from Crawl's reachability graph when configured, otherwise a static `upstream` (`ssh://` / `tcp://` prefixes stripped).
 - **core/cli:** graph snapshot + route planner; CLI hello/report/plan.
+- **Security:** opt-in mutual TLS (peer authentication + transport encryption + route authorization) for the Radii protocol and Fetch's tunnel data path — see [`docs/tls.md`](docs/tls.md).
 
 ## Configuration
 
@@ -118,6 +123,8 @@ See example files:
 - `crates/crawl/crawl.example.toml`
 - `crates/head/head.example.toml`
 - `crates/fetch/fetch.example.toml`
+
+For mutual TLS setup (certificate provisioning, rotation, revocation), see [`docs/tls.md`](docs/tls.md).
 
 ## Next steps
 

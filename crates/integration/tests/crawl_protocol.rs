@@ -10,7 +10,7 @@ async fn hello_probe_and_report_are_acked_and_stored() {
     let (listener, addr) = bind_local().await.unwrap();
     let state = Arc::new(RwLock::new(CrawlState::default()));
     let state_clone = Arc::clone(&state);
-    let handle = tokio::spawn(async move { run_on_with_state(listener, state_clone).await });
+    let handle = tokio::spawn(async move { run_on_with_state(listener, state_clone, None).await });
 
     wait_ready(&addr).await.unwrap();
 
@@ -80,7 +80,7 @@ async fn from_head_wrapper_is_ingested() {
     let (listener, addr) = bind_local().await.unwrap();
     let state = Arc::new(RwLock::new(CrawlState::default()));
     let state_clone = Arc::clone(&state);
-    let handle = tokio::spawn(async move { run_on_with_state(listener, state_clone).await });
+    let handle = tokio::spawn(async move { run_on_with_state(listener, state_clone, None).await });
     wait_ready(&addr).await.unwrap();
 
     let mut stream = TcpStream::connect(&addr).await.unwrap();

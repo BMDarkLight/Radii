@@ -1,5 +1,6 @@
 use clap::Parser;
 use radii_crawl::{config, server};
+use radii_proto::tls::TlsIdentity;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -14,5 +15,6 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let config = config::load(&args.config)?;
-    server::run(&config.bind).await
+    let tls = config.tls.as_ref().map(TlsIdentity::load).transpose()?;
+    server::run(&config.bind, tls).await
 }

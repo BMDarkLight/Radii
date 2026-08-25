@@ -12,13 +12,13 @@ async fn head_radii_bridge_forwards_to_crawl() {
     let state = Arc::new(RwLock::new(CrawlState::default()));
     let state_clone = Arc::clone(&state);
     let crawl_handle =
-        tokio::spawn(async move { run_on_with_state(crawl_listener, state_clone).await });
+        tokio::spawn(async move { run_on_with_state(crawl_listener, state_clone, None).await });
     wait_ready(&crawl_addr).await.unwrap();
 
     let (head_listener, head_addr) = bind_local().await.unwrap();
     let crawl_upstream = crawl_addr.clone();
     let head_handle =
-        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream).await });
+        tokio::spawn(async move { run_radii_on(head_listener, crawl_upstream, None).await });
     wait_ready(&head_addr).await.unwrap();
 
     let mut stream = TcpStream::connect(&head_addr).await.unwrap();

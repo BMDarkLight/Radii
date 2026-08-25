@@ -7,6 +7,23 @@ pub struct Config {
     pub bind: String,
     pub upstream: String,
     pub graph: Option<GraphConfig>,
+    /// Fetch's mTLS identity for dialing Crawl from the graph poller. Absent
+    /// means plaintext, matching today's default. See `docs/tls.md`.
+    pub tls: Option<radii_proto::tls::TlsIdentityConfig>,
+    /// TLS for the tunnel *data path* itself — independent from `tls`
+    /// above, which only protects the graph poller's connection to Crawl.
+    pub tunnel_tls: Option<TunnelTlsConfig>,
+}
+
+/// `listener` and `upstream` are independent and both optional: `listener`
+/// requires inbound clients to authenticate via mTLS before Fetch will
+/// tunnel their bytes anywhere; `upstream` dials the upstream over mTLS
+/// instead of plaintext TCP. A deployment can enable either, both, or
+/// neither.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TunnelTlsConfig {
+    pub listener: Option<radii_proto::tls::TlsIdentityConfig>,
+    pub upstream: Option<radii_proto::tls::TlsIdentityConfig>,
 }
 
 /// Configures Fetch to resolve its upstream from Crawl's live reachability

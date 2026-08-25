@@ -1,8 +1,9 @@
-use radii_proto::{read_message, write_message, GraphReport, NodeInfo, RadiiMessage};
+use radii_proto::tls::TlsIdentity;
+use radii_proto::{read_message, write_message, BoxedStream, GraphReport, NodeInfo, RadiiMessage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 #[derive(Default, Debug)]
@@ -11,36 +12,58 @@ pub struct CrawlState {
     pub reachability: Vec<RadiiMessage>,
 }
 
-pub async fn run(bind: &str) -> anyhow::Result<()> {
+pub async fn run(bind: &str, tls: Option<TlsIdentity>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "crawl listening");
-    run_on(listener).await
+    tracing::info!(%bind, tls = tls.is_some(), "crawl listening");
+    run_on(listener, tls).await
 }
 
-pub async fn run_on(listener: TcpListener) -> anyhow::Result<()> {
+pub async fn run_on(listener: TcpListener, tls: Option<TlsIdentity>) -> anyhow::Result<()> {
     let state = Arc::new(RwLock::new(CrawlState::default()));
-    run_on_with_state(listener, state).await
+    run_on_with_state(listener, state, tls).await
 }
 
 pub async fn run_on_with_state(
     listener: TcpListener,
     state: Arc<RwLock<CrawlState>>,
+    tls: Option<TlsIdentity>,
 ) -> anyhow::Result<()> {
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (raw_stream, addr) = listener.accept().await?;
         let state = Arc::clone(&state);
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, addr, state).await {
+            let result = async {
+                let (stream, peer_identity) =
+                    radii_proto::tls::accept(raw_stream, tls.as_ref()).await?;
+                handle_connection(stream, addr, state, peer_identity).await
+            }
+            .await;
+            if let Err(err) = result {
                 tracing::warn!(source = %addr, error = %err, "crawl connection failed");
             }
         });
     }
 }
 
+/// When `peer_identity` is `Some` (an mTLS-authenticated connection), a peer
+/// may only advertise hellos/reports under its *own* authenticated node id —
+/// this stops one authenticated peer from impersonating another and
+/// poisoning the graph with claims it isn't entitled to make. Connections
+/// with no TLS identity (plaintext) skip this check, matching today's
+/// unauthenticated behavior.
+fn authorized(peer_identity: &Option<String>, claimed_node_id: &str) -> bool {
+    match peer_identity {
+        Some(identity) => identity == claimed_node_id,
+        None => true,
+    }
+}
+
 async fn handle_connection(
-    mut stream: TcpStream,
+    mut stream: BoxedStream,
     addr: SocketAddr,
     state: Arc<RwLock<CrawlState>>,
+    peer_identity: Option<String>,
 ) -> anyhow::Result<()> {
     loop {
         let message = read_message(&mut stream).await?;
@@ -50,6 +73,22 @@ async fn handle_connection(
                 listen_addrs,
                 ..
             } => {
+                if !authorized(&peer_identity, &node_id) {
+                    tracing::warn!(
+                        source = %addr,
+                        peer = ?peer_identity,
+                        claimed = %node_id,
+                        "crawl rejected hello: node id does not match authenticated peer"
+                    );
+                    write_message(
+                        &mut stream,
+                        &RadiiMessage::Ack {
+                            status: "unauthorized_node_id".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut state = state.write().await;
                 state.nodes.insert(node_id.clone(), listen_addrs.clone());
                 tracing::info!(source = %addr, node = %node_id, "crawl node hello");
@@ -79,6 +118,22 @@ async fn handle_connection(
                 rtt_ms,
                 observed_addr,
             } => {
+                if !authorized(&peer_identity, &from) {
+                    tracing::warn!(
+                        source = %addr,
+                        peer = ?peer_identity,
+                        claimed = %from,
+                        "crawl rejected report: from does not match authenticated peer"
+                    );
+                    write_message(
+                        &mut stream,
+                        &RadiiMessage::Ack {
+                            status: "unauthorized_node_id".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut state = state.write().await;
                 state.reachability.push(RadiiMessage::ReachabilityReport {
                     from: from.clone(),

@@ -11,3 +11,22 @@ target_node_id = "node-b"
 poll_interval_ms = 5000
 allowed_protocols = ["ssh"]
 max_hops = 4
+
+# Optional: require mutual TLS for the graph poller's connection to Crawl
+# above. Absent, that connection stays plaintext. See docs/tls.md.
+# [tls]
+# cert = "/etc/radii/fetch.cert.pem"
+# key = "/etc/radii/fetch.key.pem"
+# ca = "/etc/radii/ca.cert.pem"
+
+# Optional: encrypt the tunnel data path itself. `listener` and `upstream`
+# are independent — enable either, both, or neither.
+# [tunnel_tls.listener]
+# cert = "/etc/radii/fetch-tunnel.cert.pem"
+# key = "/etc/radii/fetch-tunnel.key.pem"
+# ca = "/etc/radii/ca.cert.pem"
+#
+# [tunnel_tls.upstream]
+# cert = "/etc/radii/fetch-tunnel.cert.pem"
+# key = "/etc/radii/fetch-tunnel.key.pem"
+# ca = "/etc/radii/ca.cert.pem"

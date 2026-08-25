@@ -2,7 +2,7 @@
 
 Radii is a **network runtime**. Compromises in protocol handling, peer trust, or deployment hygiene can become remote code execution, traffic hijacking, or widespread denial of service. This document defines how we think about security, what is and is not safe today, how to report issues, and how operators should deploy Radii.
 
-> **Status honesty:** Radii is an early foundation. Several critical security controls (peer authentication, transport encryption, authorization, rate limiting) are **not implemented yet**. Do **not** expose Crawl, Head Radii bridges, or Fetch tunnels to untrusted networks without additional controls in front of them.
+> **Status honesty:** Radii is an early foundation. Peer authentication and transport encryption now exist as opt-in mutual TLS (see [`docs/tls.md`](docs/tls.md)), but several critical controls are still **not implemented**: TLS is not mandatory by default, replay protection, full authorization (Head-relayed messages), and rate limiting are all still gaps. Do **not** expose Crawl, Head Radii bridges, or Fetch tunnels to untrusted networks without either enabling `[tls]` everywhere it's reachable or additional controls in front of them.
 
 ---
 
@@ -95,7 +95,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 
 1. **Remote network attacker** who can open TCP connections to exposed binds
 2. **Malicious or compromised peer** sending crafted Radii frames, hellos, or reports
-3. **On-path network attacker** (MITM) on plaintext links
+3. **On-path network attacker** (MITM) on plaintext links — mitigated where mTLS is enabled (see [Cryptography](#cryptography-target-state)), still applicable on any link left plaintext
 4. **Local attacker** with filesystem access to configs, logs, or process memory
 5. **Operator misconfiguration** (binding `0.0.0.0`, tunneling to internal-only services)
 
@@ -118,21 +118,23 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Structured logging | `radii-core` | Operational visibility; may contain IPs/hosts — protect log directories |
 | Decision isolation | `radii-head` | Routing decision is config-driven; no remote code execution path in decision JSON |
 | CI lint/tests/audit | `.github/workflows` | Format, Clippy, tests, `cargo audit`, `cargo deny` |
+| Mutual TLS (opt-in) | `radii-proto::tls`, wired into `radii-crawl`, `radii-head`, `radii-fetch`, `radii-cli` | Peer-authenticated, encrypted transport for the Radii control protocol (Crawl's listener, Head↔Crawl bridge, graph queries) and optionally Fetch's tunnel data path, when a `[tls]` / `[tunnel_tls]` section is configured. Private-CA model, not the public Web PKI. See [`docs/tls.md`](docs/tls.md). |
+| Route authorization by peer identity | `radii-crawl` | When TLS is enabled, a peer may only submit `NodeHello` / `ReachabilityReport` under its own authenticated node id — direct connections only, see limitation below |
 
 ### What is NOT implemented (treat as known gaps)
 
 | Gap | Risk if exposed |
 |---|---|
-| No peer authentication / mutual TLS | Anyone who can connect can inject Crawl hellos/reports |
-| No message signing or anti-replay | Topology poisoning, replay of stale reachability |
-| No transport encryption on Radii/Fetch TCP | Eavesdropping and MITM |
+| Peer authentication / mutual TLS is opt-in, not mandatory | Any listener without `[tls]` configured stays plaintext and unauthenticated — anyone who can connect can inject Crawl hellos/reports |
+| No message signing or anti-replay | An authenticated peer (with or without TLS) can still resend its own old, valid-but-stale reports — mTLS proves who sent a message, not when it was generated |
+| Route authorization doesn't cover Head-relayed messages | Crawl authorizes the direct peer on a connection, not the original client behind Head's `FromHead` bridge — a compromised Head can inject reports under any node id |
 | No authorization on Head HTTP | Information disclosure of backend maps via decision JSON |
-| No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch |
+| No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch, TLS-authenticated or not |
 | Fetch is an open TCP tunnel to configured upstream | Misbind + exposure ≈ proxy to internal services |
 | No sandboxing of protocol workers | A memory-safety bug would be process-wide (Rust reduces but does not eliminate risk) |
 | Logs may include client IPs and hosts | Privacy / compliance exposure |
 
-**Operational rule:** bind Crawl, Head Radii, and Fetch to localhost or a private management network unless you have placed authenticated reverse proxies / firewalls in front.
+**Operational rule:** bind Crawl, Head Radii, and Fetch to localhost or a private management network unless you have placed authenticated reverse proxies / firewalls in front, **or** enabled mTLS (see [`docs/tls.md`](docs/tls.md)) on every listener that must be reachable beyond a single trusted host.
 
 ---
 
@@ -146,10 +148,16 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 - [ ] Use host firewalls / security groups to restrict source IPs for management ports
 - [ ] Disable or avoid running unused listeners
 
+### Peer authentication (mTLS)
+
+- [ ] Enable `[tls]` on Crawl and Head, and `[tunnel_tls]` on Fetch, for any listener reachable beyond a single trusted host — see [`docs/tls.md`](docs/tls.md)
+- [ ] Provision certificates from a private CA you control; keep the CA private key offline or in a secrets manager
+- [ ] Remember mTLS authenticates the immediate peer on a connection, not the original client behind Head's bridge — see the FromHead limitation above
+
 ### Configuration hygiene
 
 - [ ] Treat config files as sensitive (upstreams reveal internal topology)
-- [ ] Do not commit real certs, host keys, or production TOML into git
+- [ ] Do not commit real certs, host keys, or production TOML into git — `scripts/gen-dev-certs.sh` output is for local use only
 - [ ] Set `RADII_LOG_DIR` to a directory with restricted permissions
 - [ ] Rotate any credentials used in front of Radii independently of this project
 
@@ -165,13 +173,13 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 
 Radii intends to require, before production claims:
 
-1. Authenticated peer identity (e.g. ed25519 / mutual TLS)
-2. Encrypted transports for Radii control messages and Fetch data paths
-3. Explicit route authorization (which peers may advertise which links)
-4. Replay protection and bounded clock skew for probes/reports
-5. Documented key lifecycle (provisioning, rotation, revocation)
+1. **Authenticated peer identity** (e.g. ed25519 / mutual TLS) — implemented, opt-in via `[tls]`. See [`docs/tls.md`](docs/tls.md).
+2. **Encrypted transports** for Radii control messages and Fetch data paths — implemented, opt-in via `[tls]` / `[tunnel_tls]`. See [`docs/tls.md`](docs/tls.md).
+3. **Explicit route authorization** (which peers may advertise which links) — partially implemented: Crawl checks a direct peer's `NodeHello`/`ReachabilityReport` against its authenticated identity, but does not independently re-verify identities relayed through Head's `FromHead` bridge.
+4. **Replay protection and bounded clock skew** for probes/reports — not implemented. mTLS proves who sent a message, not when it was generated; an authenticated peer can still resend its own stale reports.
+5. **Documented key lifecycle** (provisioning, rotation, revocation) — implemented. See [`docs/tls.md`](docs/tls.md).
 
-Until those land, **do not describe Radii as censorship-resistant or confidential in a cryptographic sense**—resilience goals are architectural, not yet proven by the wire protocol.
+Item 4 has not landed, and item 3 is incomplete, and TLS itself is opt-in rather than mandatory-by-default — so even with `[tls]` configured everywhere, **do not describe Radii as censorship-resistant or confidential in a cryptographic sense**: resilience goals are architectural, not yet fully proven by the wire protocol.
 
 ---
 
@@ -216,6 +224,7 @@ Security-sensitive automated coverage includes:
 - Head host-map decisions (no unintended backend selection)
 - Fetch tunnel correctness (so future auth wrappers do not regress data path)
 - Head → Crawl Radii bridge wrapping (`FromHead`)
+- mTLS handshake success/failure (trusted peer accepted, untrusted-CA peer rejected, plaintext-only fallback) and peer-identity authorization (`radii-proto::tls`, `crawl_tls`, `fetch_tls` integration tests)
 
 CI must remain green on these tests for merges to `main`.
 

@@ -2,6 +2,7 @@ use crate::config::GraphConfig;
 use radii_core::routing::{
     DefaultScorer, GraphSnapshot, Link, NodeId, ProtocolId, RoutePlanner, RouteRequest,
 };
+use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -20,10 +21,14 @@ pub type SharedGraphState = Arc<RwLock<GraphState>>;
 /// place. Runs until the process shuts down; transient query failures are
 /// logged and retried rather than propagated, so a Crawl outage does not take
 /// Head down with it.
-pub async fn run_poll(config: GraphConfig, state: SharedGraphState) -> anyhow::Result<()> {
+pub async fn run_poll(
+    config: GraphConfig,
+    state: SharedGraphState,
+    tls: Option<TlsIdentity>,
+) -> anyhow::Result<()> {
     let interval = Duration::from_millis(config.poll_interval_ms.max(1));
     loop {
-        match fetch_once(&config.crawl_upstream).await {
+        match fetch_once(&config.crawl_upstream, tls.as_ref()).await {
             Ok((snapshot, listen_addrs)) => {
                 let mut guard = state.write().expect("graph state poisoned");
                 guard.snapshot = snapshot;
@@ -40,8 +45,10 @@ pub async fn run_poll(config: GraphConfig, state: SharedGraphState) -> anyhow::R
 
 async fn fetch_once(
     crawl_upstream: &str,
+    tls: Option<&TlsIdentity>,
 ) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<String>>)> {
-    let (nodes, reports) = radii_proto::query_graph(crawl_upstream).await?;
+    let mut stream = radii_proto::tls::dial(crawl_upstream, tls).await?;
+    let (nodes, reports) = radii_proto::query_graph_on(&mut stream).await?;
 
     let mut snapshot = GraphSnapshot::new();
     for report in reports {

@@ -1,5 +1,7 @@
 //! Cross-crate integration helpers for Radii smoke and protocol tests.
 
+pub mod pki;
+
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;

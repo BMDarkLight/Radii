@@ -9,6 +9,11 @@ pub struct Config {
     pub radii: Option<RadiiConfig>,
     pub routing: RoutingConfig,
     pub graph: Option<GraphConfig>,
+    /// Head's mTLS identity, used both for the Radii bridge listener
+    /// (server role) and for dialing Crawl (client role, for the bridge and
+    /// the graph poller). Absent means plaintext, matching today's default.
+    /// See `docs/tls.md`.
+    pub tls: Option<radii_proto::tls::TlsIdentityConfig>,
 }
 
 #[derive(Debug, Deserialize)]

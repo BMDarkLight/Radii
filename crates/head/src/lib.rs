@@ -7,9 +7,12 @@ pub mod runners;
 
 use crate::decision::{DecisionEngine, GraphRoutePolicy};
 use radii_core::registry::ProtocolRegistry;
+use radii_proto::tls::TlsIdentity;
 use std::sync::{Arc, RwLock};
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
+    let tls = config.tls.as_ref().map(TlsIdentity::load).transpose()?;
+
     let graph_state: graph::SharedGraphState = Arc::new(RwLock::new(graph::GraphState::default()));
 
     let graph_policy = config.graph.as_ref().map(|graph_config| {
@@ -29,10 +32,14 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
             config.http.bind.clone(),
             decision.clone(),
         ))
-        .register(runners::RadiiRunner::maybe_new(config.radii.clone()))
+        .register(runners::RadiiRunner::maybe_new(
+            config.radii.clone(),
+            tls.clone(),
+        ))
         .register(runners::GraphPollRunner::maybe_new(
             config.graph.clone(),
             graph_state,
+            tls,
         ));
 
     registry.run_all().await

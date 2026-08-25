@@ -12,9 +12,15 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
-
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "net"] }
+tokio-rustls = "0.26"
+x509-parser = "0.16"
 
 [dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }

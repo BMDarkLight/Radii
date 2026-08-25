@@ -1,3 +1,5 @@
+pub mod tls;
+
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -7,6 +9,14 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 ///
 /// Protects listeners from unbounded allocations on a hostile length prefix.
 pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
+
+/// A connected transport, plaintext or TLS — boxing behind this trait lets
+/// connection-handling code stay transport-agnostic once the (optional) TLS
+/// handshake is done, since [`read_message`]/[`write_message`] only need
+/// `AsyncRead`/`AsyncWrite`.
+pub trait AsyncDuplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncDuplex for T {}
+pub type BoxedStream = Box<dyn AsyncDuplex>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RadiiMessage {
@@ -72,14 +82,24 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Opens a fresh connection to a Crawl (or Crawl-speaking) listener, sends a
-/// `GraphQuery`, and returns the node registry and reachability reports from
-/// its `GraphSnapshot` reply. Shared by any compartment that needs to resolve
-/// live topology (Head's decision engine, Fetch's path selection, ...).
+/// Opens a fresh plaintext connection to a Crawl (or Crawl-speaking)
+/// listener, sends a `GraphQuery`, and returns the node registry and
+/// reachability reports from its `GraphSnapshot` reply. Callers that need a
+/// TLS-protected connection should dial via [`tls::dial`] and call
+/// [`query_graph_on`] on the resulting stream instead.
 pub async fn query_graph<A: ToSocketAddrs>(addr: A) -> Result<(Vec<NodeInfo>, Vec<GraphReport>)> {
     let mut stream = TcpStream::connect(addr).await?;
-    write_message(&mut stream, &RadiiMessage::GraphQuery).await?;
-    match read_message(&mut stream).await? {
+    query_graph_on(&mut stream).await
+}
+
+/// Sends a `GraphQuery` over an already-established connection (plaintext or
+/// TLS) and returns the node registry and reachability reports from the
+/// `GraphSnapshot` reply.
+pub async fn query_graph_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(Vec<NodeInfo>, Vec<GraphReport>)> {
+    write_message(stream, &RadiiMessage::GraphQuery).await?;
+    match read_message(stream).await? {
         RadiiMessage::GraphSnapshot { nodes, reports } => Ok((nodes, reports)),
         other => bail!("unexpected reply to graph query: {other:?}"),
     }

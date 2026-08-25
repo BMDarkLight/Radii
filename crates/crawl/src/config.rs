@@ -5,6 +5,9 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub bind: String,
+    /// Requires mutual TLS on the Crawl listener when present; connections
+    /// stay plaintext when absent. See `docs/tls.md`.
+    pub tls: Option<radii_proto::tls::TlsIdentityConfig>,
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {

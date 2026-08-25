@@ -24,3 +24,11 @@ max_hops = 4
 
 [graph.node_map]
 "example.com" = "node-b"
+
+# Optional: require mutual TLS for the Radii bridge listener above and for
+# every outbound connection Head makes to Crawl (the bridge relay and the
+# graph poller). Absent, those connections stay plaintext. See docs/tls.md.
+# [tls]
+# cert = "/etc/radii/head.cert.pem"
+# key = "/etc/radii/head.key.pem"
+# ca = "/etc/radii/ca.cert.pem"

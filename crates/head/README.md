@@ -17,6 +17,7 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
   2. **Host map** — static `routing.host_map` lookup.
   3. **Default** — `routing.default_backend`.
 - Optional Radii TCP bridge that wraps inbound messages as `FromHead` and forwards to Crawl over a single persistent upstream session per client connection (opened lazily on the first message, reconnected transparently if Crawl drops it) rather than dialing Crawl anew for every message
+- Optional mutual TLS (`[tls]` config): requires mTLS on the bridge listener *and* on every outbound connection Head makes to Crawl (the bridge relay, the graph poller). See [`docs/tls.md`](../../docs/tls.md).
 
 ## Next
 

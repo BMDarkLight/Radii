@@ -18,7 +18,9 @@ async fn head_resolves_backend_from_crawl_graph() {
     let crawl_state = Arc::new(tokio::sync::RwLock::new(CrawlState::default()));
     let crawl_state_clone = Arc::clone(&crawl_state);
     let crawl_handle =
-        tokio::spawn(async move { run_on_with_state(crawl_listener, crawl_state_clone).await });
+        tokio::spawn(
+            async move { run_on_with_state(crawl_listener, crawl_state_clone, None).await },
+        );
     wait_ready(&crawl_addr).await.unwrap();
 
     // node-b registers its address, then a report shows head -> node-b is
@@ -61,7 +63,11 @@ async fn head_resolves_backend_from_crawl_graph() {
         max_hops: 4,
         node_map: HashMap::new(),
     };
-    let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&graph_state)));
+    let poll_handle = tokio::spawn(graph::run_poll(
+        graph_config,
+        Arc::clone(&graph_state),
+        None,
+    ));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {

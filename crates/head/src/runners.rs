@@ -1,5 +1,6 @@
 use crate::{config, decision::DecisionEngine, graph, http, radii};
 use radii_core::registry::{BoxFuture, ProtocolRunner};
+use radii_proto::tls::TlsIdentity;
 use std::sync::Arc;
 
 pub struct HttpRunner {
@@ -27,11 +28,12 @@ impl ProtocolRunner for HttpRunner {
 
 pub struct RadiiRunner {
     config: Option<config::RadiiConfig>,
+    tls: Option<TlsIdentity>,
 }
 
 impl RadiiRunner {
-    pub fn maybe_new(config: Option<config::RadiiConfig>) -> Self {
-        Self { config }
+    pub fn maybe_new(config: Option<config::RadiiConfig>, tls: Option<TlsIdentity>) -> Self {
+        Self { config, tls }
     }
 }
 
@@ -42,18 +44,24 @@ impl ProtocolRunner for RadiiRunner {
 
     fn start(&self) -> BoxFuture<'_> {
         let config = self.config.clone();
-        Box::pin(async move { radii::maybe_run_radii(&config).await })
+        let tls = self.tls.clone();
+        Box::pin(async move { radii::maybe_run_radii(&config, tls).await })
     }
 }
 
 pub struct GraphPollRunner {
     config: Option<config::GraphConfig>,
     state: graph::SharedGraphState,
+    tls: Option<TlsIdentity>,
 }
 
 impl GraphPollRunner {
-    pub fn maybe_new(config: Option<config::GraphConfig>, state: graph::SharedGraphState) -> Self {
-        Self { config, state }
+    pub fn maybe_new(
+        config: Option<config::GraphConfig>,
+        state: graph::SharedGraphState,
+        tls: Option<TlsIdentity>,
+    ) -> Self {
+        Self { config, state, tls }
     }
 }
 
@@ -65,11 +73,12 @@ impl ProtocolRunner for GraphPollRunner {
     fn start(&self) -> BoxFuture<'_> {
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
+        let tls = self.tls.clone();
         Box::pin(async move {
             let Some(config) = config else {
                 return Ok(());
             };
-            graph::run_poll(config, state).await
+            graph::run_poll(config, state, tls).await
         })
     }
 }

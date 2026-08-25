@@ -15,6 +15,7 @@ cargo run -p radii-cli -- plan --source a --target c --protocols radii < reports
 
 - `hello` / `report` send framed Radii messages and print acks when present
 - `plan` reads JSONL `ReachabilityReport` lines from stdin and prints scored paths
+- `hello` / `report` accept `--tls-cert` / `--tls-key` / `--tls-ca` to speak mTLS to a `[tls]`-enabled Crawl or Head bridge (all three or none — see [`docs/tls.md`](../../docs/tls.md))
 
 ## Next
 

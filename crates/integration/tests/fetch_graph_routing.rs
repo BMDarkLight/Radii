@@ -17,7 +17,7 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
     let (crawl_listener, crawl_addr) = bind_local().await.unwrap();
     let crawl_state = Arc::new(tokio::sync::RwLock::new(CrawlState::default()));
     let crawl_handle =
-        tokio::spawn(async move { run_on_with_state(crawl_listener, crawl_state).await });
+        tokio::spawn(async move { run_on_with_state(crawl_listener, crawl_state, None).await });
     wait_ready(&crawl_addr).await.unwrap();
 
     // A real upstream endpoint that echoes back what it receives; this is
@@ -77,7 +77,7 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
         allowed_protocols: vec!["ssh".into()],
         max_hops: 4,
     };
-    let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&target)));
+    let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&target), None));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
