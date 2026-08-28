@@ -99,6 +99,8 @@ cargo run -p radii-cli -- report --addr 127.0.0.1:7100 \
 
 Against a `[tls]`-enabled Crawl/Head, add `--tls-cert`, `--tls-key`, and `--tls-ca` to `hello`/`report` — see [`docs/tls.md`](docs/tls.md).
 
+The CLI's `hello` command only sends one `NodeHello`; a real participant needs to repeat it periodically (well under Crawl's default 60s liveness TTL, `node_ttl_ms`) to stay live in Crawl's registry.
+
 Plan routes from JSONL reports on stdin:
 
 ```bash

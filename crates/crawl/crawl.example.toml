@@ -1,5 +1,11 @@
 bind = "0.0.0.0:7100"
 
+# Optional: how long (ms) a node may go without sending a fresh NodeHello
+# before it drops out of GraphQuery replies. Defaults to 60000 (60s) when
+# absent. A long-lived participant should re-send NodeHello at an interval
+# well under this value.
+# node_ttl_ms = 60000
+
 # Optional: require mutual TLS on this listener. When configured, every
 # connection (from Head's bridge, radii-cli, or other peers) must present a
 # certificate signed by `ca`; connections without one are rejected during the
