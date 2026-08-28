@@ -16,5 +16,5 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = config::load(&args.config)?;
     let tls = config.tls.as_ref().map(TlsIdentity::load).transpose()?;
-    server::run(&config.bind, tls).await
+    server::run(&config.bind, tls, Some(config.node_ttl_ms)).await
 }

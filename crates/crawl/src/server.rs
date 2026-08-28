@@ -31,14 +31,25 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub async fn run(bind: &str, tls: Option<TlsIdentity>) -> anyhow::Result<()> {
+pub async fn run(
+    bind: &str,
+    tls: Option<TlsIdentity>,
+    node_ttl_ms: Option<u64>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, tls = tls.is_some(), "crawl listening");
-    run_on(listener, tls).await
+    run_on(listener, tls, node_ttl_ms).await
 }
 
-pub async fn run_on(listener: TcpListener, tls: Option<TlsIdentity>) -> anyhow::Result<()> {
-    let state = Arc::new(RwLock::new(CrawlState::default()));
+pub async fn run_on(
+    listener: TcpListener,
+    tls: Option<TlsIdentity>,
+    node_ttl_ms: Option<u64>,
+) -> anyhow::Result<()> {
+    let state = Arc::new(RwLock::new(CrawlState {
+        node_ttl_ms,
+        ..CrawlState::default()
+    }));
     run_on_with_state(listener, state, tls).await
 }
 
