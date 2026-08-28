@@ -402,7 +402,9 @@ mod tests {
             node_ttl_ms: Some(5_000),
             ..CrawlState::default()
         };
-        state.nodes.insert("fresh".to_string(), entry(vec![], 9_000));
+        state
+            .nodes
+            .insert("fresh".to_string(), entry(vec![], 9_000));
         state.nodes.insert("stale".to_string(), entry(vec![], 0));
         state.reachability.push(RadiiMessage::ReachabilityReport {
             from: "fresh".to_string(),
