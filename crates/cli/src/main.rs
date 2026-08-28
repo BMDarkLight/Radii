@@ -5,7 +5,7 @@ use radii_core::routing::{
     RouteRequest,
 };
 use radii_proto::tls::{TlsIdentity, TlsIdentityConfig};
-use radii_proto::{read_message, write_message, RadiiMessage};
+use radii_proto::RadiiMessage;
 use std::io::{stdin, BufRead};
 use std::path::PathBuf;
 
@@ -107,18 +107,7 @@ async fn main() -> Result<()> {
             roles,
             listen_addrs,
             tls,
-        } => {
-            send_message(
-                &addr,
-                RadiiMessage::NodeHello {
-                    node_id,
-                    roles,
-                    listen_addrs,
-                },
-                tls,
-            )
-            .await
-        }
+        } => send_hello(&addr, node_id, roles, listen_addrs, tls).await,
         Commands::Report {
             addr,
             from,
@@ -129,16 +118,14 @@ async fn main() -> Result<()> {
             observed_addr,
             tls,
         } => {
-            send_message(
+            send_report(
                 &addr,
-                RadiiMessage::ReachabilityReport {
-                    from,
-                    target,
-                    protocol,
-                    reachable,
-                    rtt_ms,
-                    observed_addr,
-                },
+                from,
+                target,
+                protocol,
+                reachable,
+                rtt_ms,
+                observed_addr,
                 tls,
             )
             .await
@@ -153,11 +140,48 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn send_message(addr: &str, message: RadiiMessage, tls: TlsArgs) -> Result<()> {
+async fn send_hello(
+    addr: &str,
+    node_id: String,
+    roles: Vec<String>,
+    listen_addrs: Vec<String>,
+    tls: TlsArgs,
+) -> Result<()> {
     let tls = tls.load()?;
     let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
-    write_message(&mut stream, &message).await?;
-    match read_message(&mut stream).await {
+    print_reply(radii_proto::send_hello_on(&mut stream, node_id, roles, listen_addrs).await);
+    Ok(())
+}
+
+async fn send_report(
+    addr: &str,
+    from: String,
+    target: String,
+    protocol: String,
+    reachable: bool,
+    rtt_ms: Option<u32>,
+    observed_addr: Option<String>,
+    tls: TlsArgs,
+) -> Result<()> {
+    let tls = tls.load()?;
+    let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
+    print_reply(
+        radii_proto::send_report_on(
+            &mut stream,
+            from,
+            target,
+            protocol,
+            reachable,
+            rtt_ms,
+            observed_addr,
+        )
+        .await,
+    );
+    Ok(())
+}
+
+fn print_reply(result: Result<RadiiMessage>) {
+    match result {
         Ok(RadiiMessage::Ack { status }) => {
             tracing::info!(%status, "received ack");
             println!("ack={status}");
@@ -171,7 +195,6 @@ async fn send_message(addr: &str, message: RadiiMessage, tls: TlsArgs) -> Result
             tracing::warn!(error = %err, "no ack received");
         }
     }
-    Ok(())
 }
 
 fn plan_routes(
