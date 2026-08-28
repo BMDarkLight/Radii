@@ -106,6 +106,92 @@ pub async fn query_graph_on<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// Opens a fresh plaintext connection and sends a `NodeHello`, returning
+/// whatever the peer replies with (typically an `Ack`). Callers that need a
+/// TLS-protected connection should dial via [`tls::dial`] and call
+/// [`send_hello_on`] on the resulting stream instead.
+pub async fn send_hello<A: ToSocketAddrs>(
+    addr: A,
+    node_id: String,
+    roles: Vec<String>,
+    listen_addrs: Vec<String>,
+) -> Result<RadiiMessage> {
+    let mut stream = TcpStream::connect(addr).await?;
+    send_hello_on(&mut stream, node_id, roles, listen_addrs).await
+}
+
+/// Sends a `NodeHello` over an already-established connection (plaintext or
+/// TLS) and returns whatever the peer replies with.
+pub async fn send_hello_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    node_id: String,
+    roles: Vec<String>,
+    listen_addrs: Vec<String>,
+) -> Result<RadiiMessage> {
+    write_message(
+        stream,
+        &RadiiMessage::NodeHello {
+            node_id,
+            roles,
+            listen_addrs,
+        },
+    )
+    .await?;
+    read_message(stream).await
+}
+
+/// Opens a fresh plaintext connection and sends a `ReachabilityReport`,
+/// returning whatever the peer replies with. Callers that need a
+/// TLS-protected connection should dial via [`tls::dial`] and call
+/// [`send_report_on`] on the resulting stream instead.
+pub async fn send_report<A: ToSocketAddrs>(
+    addr: A,
+    from: String,
+    target: String,
+    protocol: String,
+    reachable: bool,
+    rtt_ms: Option<u32>,
+    observed_addr: Option<String>,
+) -> Result<RadiiMessage> {
+    let mut stream = TcpStream::connect(addr).await?;
+    send_report_on(
+        &mut stream,
+        from,
+        target,
+        protocol,
+        reachable,
+        rtt_ms,
+        observed_addr,
+    )
+    .await
+}
+
+/// Sends a `ReachabilityReport` over an already-established connection
+/// (plaintext or TLS) and returns whatever the peer replies with.
+pub async fn send_report_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    from: String,
+    target: String,
+    protocol: String,
+    reachable: bool,
+    rtt_ms: Option<u32>,
+    observed_addr: Option<String>,
+) -> Result<RadiiMessage> {
+    write_message(
+        stream,
+        &RadiiMessage::ReachabilityReport {
+            from,
+            target,
+            protocol,
+            reachable,
+            rtt_ms,
+            observed_addr,
+        },
+    )
+    .await?;
+    read_message(stream).await
+}
+
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiMessage> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
@@ -229,5 +315,93 @@ mod tests {
             .unwrap();
         client.write_all(&garbage).await.unwrap();
         assert!(read_message(&mut server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_hello_on_round_trips_ack() {
+        let (mut client, mut server): (DuplexStream, DuplexStream) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let message = read_message(&mut server).await.unwrap();
+            assert_eq!(
+                message,
+                RadiiMessage::NodeHello {
+                    node_id: "node-a".into(),
+                    roles: vec!["wave".into()],
+                    listen_addrs: vec!["127.0.0.1:1".into()],
+                }
+            );
+            write_message(
+                &mut server,
+                &RadiiMessage::Ack {
+                    status: "hello_received".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let reply = send_hello_on(
+            &mut client,
+            "node-a".into(),
+            vec!["wave".into()],
+            vec!["127.0.0.1:1".into()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reply,
+            RadiiMessage::Ack {
+                status: "hello_received".into()
+            }
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_report_on_round_trips_ack() {
+        let (mut client, mut server): (DuplexStream, DuplexStream) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let message = read_message(&mut server).await.unwrap();
+            assert_eq!(
+                message,
+                RadiiMessage::ReachabilityReport {
+                    from: "a".into(),
+                    target: "b".into(),
+                    protocol: "http".into(),
+                    reachable: true,
+                    rtt_ms: Some(12),
+                    observed_addr: None,
+                }
+            );
+            write_message(
+                &mut server,
+                &RadiiMessage::Ack {
+                    status: "report_received".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let reply = send_report_on(
+            &mut client,
+            "a".into(),
+            "b".into(),
+            "http".into(),
+            true,
+            Some(12),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reply,
+            RadiiMessage::Ack {
+                status: "report_received".into()
+            }
+        );
+        server_task.await.unwrap();
     }
 }
