@@ -149,10 +149,14 @@ async fn send_hello(
 ) -> Result<()> {
     let tls = tls.load()?;
     let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
-    print_reply(radii_proto::send_hello_on(&mut stream, node_id, roles, listen_addrs).await);
+    let reply = radii_proto::send_hello_on(&mut stream, node_id, roles, listen_addrs).await?;
+    print_reply(reply);
     Ok(())
 }
 
+// Mirrors radii_proto::send_report_on's parameter shape, which itself mirrors
+// the ReachabilityReport message's fields.
+#[allow(clippy::too_many_arguments)]
 async fn send_report(
     addr: &str,
     from: String,
@@ -165,34 +169,35 @@ async fn send_report(
 ) -> Result<()> {
     let tls = tls.load()?;
     let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
-    print_reply(
-        radii_proto::send_report_on(
-            &mut stream,
-            from,
-            target,
-            protocol,
-            reachable,
-            rtt_ms,
-            observed_addr,
-        )
-        .await,
-    );
+    let reply = radii_proto::send_report_on(
+        &mut stream,
+        from,
+        target,
+        protocol,
+        reachable,
+        rtt_ms,
+        observed_addr,
+    )
+    .await?;
+    print_reply(reply);
     Ok(())
 }
 
-fn print_reply(result: Result<RadiiMessage>) {
-    match result {
-        Ok(RadiiMessage::Ack { status }) => {
+// Both send_hello_on and send_report_on fuse the write and the ack-read into
+// a single Result. Every message handler in this codebase (crates/crawl/src/server.rs)
+// always sends an Ack for every message type it recognizes, so the historical
+// "some early listeners may close without an ack" scenario no longer applies to
+// any real Radii component today. Any error here is a genuine connection failure
+// (on either the write or the read side) and propagates as a hard CLI error via `?`.
+fn print_reply(message: RadiiMessage) {
+    match message {
+        RadiiMessage::Ack { status } => {
             tracing::info!(%status, "received ack");
             println!("ack={status}");
         }
-        Ok(other) => {
+        other => {
             tracing::info!(message = ?other, "received reply");
             println!("reply={other:?}");
-        }
-        Err(err) => {
-            // Some early listeners may close without an ack; still treat send as success.
-            tracing::warn!(error = %err, "no ack received");
         }
     }
 }
