@@ -66,8 +66,8 @@ async fn hello_probe_and_report_are_acked_and_stored() {
     {
         let guard = state.read().await;
         assert_eq!(
-            guard.nodes.get("node-a").unwrap(),
-            &vec!["127.0.0.1:1".to_string()]
+            guard.nodes.get("node-a").unwrap().listen_addrs,
+            vec!["127.0.0.1:1".to_string()]
         );
         assert_eq!(guard.reachability.len(), 1);
     }

@@ -57,6 +57,7 @@ pub enum RadiiMessage {
 pub struct NodeInfo {
     pub node_id: String,
     pub listen_addrs: Vec<String>,
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +184,7 @@ mod tests {
             nodes: vec![NodeInfo {
                 node_id: "node-a".into(),
                 listen_addrs: vec!["127.0.0.1:9000".into()],
+                roles: vec!["crawl".into()],
             }],
             reports: vec![GraphReport {
                 from: "node-a".into(),
