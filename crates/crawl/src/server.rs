@@ -9,6 +9,14 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+/// Ceilings on how much reachability state peers can make Crawl hold.
+///
+/// The per-peer ceiling matters as much as the global one: with only a global
+/// cap, a single peer reporting about invented targets fills the table and
+/// starves honest peers out of it.
+pub const MAX_REACHABILITY_ENTRIES: usize = 16_384;
+pub const MAX_REACHABILITY_ENTRIES_PER_PEER: usize = 1_024;
+
 #[derive(Debug, Clone)]
 pub struct NodeEntry {
     pub listen_addrs: Vec<String>,
@@ -16,18 +24,88 @@ pub struct NodeEntry {
     pub last_seen_unix_ms: u64,
 }
 
+/// Identifies one observation: who observed it, about what, over which
+/// protocol. A fresh report for the same key replaces the old one rather than
+/// accumulating beside it — re-sending a report is a heartbeat, not new
+/// information, so it must not grow the table.
+pub type ReachabilityKey = (String, String, String);
+
+/// One peer's most recent observation about one target and protocol.
+#[derive(Debug, Clone)]
+pub struct ReachabilityEntry {
+    pub reachable: bool,
+    pub rtt_ms: Option<u32>,
+    pub observed_addr: Option<String>,
+    pub last_seen_unix_ms: u64,
+}
+
 #[derive(Default, Debug)]
 pub struct CrawlState {
     pub nodes: HashMap<String, NodeEntry>,
-    pub reachability: Vec<RadiiMessage>,
-    /// `None` means nodes never expire (today's behavior, and the default
-    /// via `CrawlState::default()`). `Some(ttl)` drops a node from
-    /// `GraphQuery` replies once `now - last_seen_unix_ms > ttl`.
+    /// Keyed rather than appended, and capped. This used to be a `Vec` that
+    /// only ever grew: every heartbeat from every peer appended a duplicate,
+    /// nothing expired, and each `GraphQuery` cloned the whole thing — while
+    /// also being the input to route planning, which is super-linear in it.
+    pub reachability: HashMap<ReachabilityKey, ReachabilityEntry>,
+    /// `None` means entries never expire (today's behavior, and the default
+    /// via `CrawlState::default()`). `Some(ttl)` drops a node *and* a stale
+    /// observation from `GraphQuery` replies once
+    /// `now - last_seen_unix_ms > ttl`. `NodeHello` and `ReachabilityReport`
+    /// are both heartbeats, so one freshness window governs both.
     pub node_ttl_ms: Option<u64>,
     /// Authenticated node ids allowed to relay `FromHead` envelopes. Empty
     /// (the default) means nobody may relay over an authenticated
     /// connection. See `Config::relay_peers`.
     pub relay_peers: HashSet<String>,
+}
+
+impl CrawlState {
+    /// Records one observation, replacing any previous one from the same peer
+    /// about the same target and protocol.
+    ///
+    /// Returns `false` when the report was refused because the table is full.
+    /// A refusal only ever affects a *new* key: an update to an existing entry
+    /// costs no growth and is always accepted, so a peer that keeps its
+    /// existing reports fresh is never rejected.
+    pub fn record_report(&mut self, key: ReachabilityKey, entry: ReachabilityEntry) -> bool {
+        if let Some(existing) = self.reachability.get_mut(&key) {
+            *existing = entry;
+            return true;
+        }
+
+        if self.reachability.len() >= MAX_REACHABILITY_ENTRIES {
+            self.expire_reports(entry.last_seen_unix_ms);
+        }
+        if self.reachability.len() >= MAX_REACHABILITY_ENTRIES {
+            return false;
+        }
+
+        // Counted on demand rather than tracked incrementally: this runs only
+        // when a peer introduces a key it has never reported before, which is
+        // rare once a mesh has settled, and it keeps one source of truth.
+        let from = &key.0;
+        let peer_entries = self
+            .reachability
+            .keys()
+            .filter(|(candidate, _, _)| candidate == from)
+            .count();
+        if peer_entries >= MAX_REACHABILITY_ENTRIES_PER_PEER {
+            return false;
+        }
+
+        self.reachability.insert(key, entry);
+        true
+    }
+
+    /// Drops observations older than the configured TTL. No-op when liveness
+    /// is disabled.
+    fn expire_reports(&mut self, now_unix_ms: u64) {
+        let Some(ttl) = self.node_ttl_ms else {
+            return;
+        };
+        self.reachability
+            .retain(|_, entry| now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= ttl);
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -220,14 +298,32 @@ async fn handle_connection(
                     continue;
                 }
                 let mut state = state.write().await;
-                state.reachability.push(RadiiMessage::ReachabilityReport {
-                    from: from.clone(),
-                    target: target.clone(),
-                    protocol: protocol.clone(),
-                    reachable,
-                    rtt_ms,
-                    observed_addr: observed_addr.clone(),
-                });
+                let accepted = state.record_report(
+                    (from.clone(), target.clone(), protocol.clone()),
+                    ReachabilityEntry {
+                        reachable,
+                        rtt_ms,
+                        observed_addr: observed_addr.clone(),
+                        last_seen_unix_ms: now_unix_ms(),
+                    },
+                );
+                drop(state);
+                if !accepted {
+                    tracing::warn!(
+                        source = %addr,
+                        from = %from,
+                        target = %target,
+                        "crawl dropped report: reachability table is full"
+                    );
+                    write_message(
+                        &mut stream,
+                        &RadiiMessage::Ack {
+                            status: "reachability_table_full".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 tracing::info!(
                     source = %addr,
                     from = %from,
@@ -361,14 +457,25 @@ async fn handle_wrapped_message(
             observed_addr,
         } => {
             let mut state = state.write().await;
-            state.reachability.push(RadiiMessage::ReachabilityReport {
-                from: from.clone(),
-                target: target.clone(),
-                protocol: protocol.clone(),
-                reachable,
-                rtt_ms,
-                observed_addr,
-            });
+            let accepted = state.record_report(
+                (from.clone(), target.clone(), protocol.clone()),
+                ReachabilityEntry {
+                    reachable,
+                    rtt_ms,
+                    observed_addr,
+                    last_seen_unix_ms: now_unix_ms(),
+                },
+            );
+            drop(state);
+            if !accepted {
+                tracing::warn!(
+                    via = %source,
+                    from = %from,
+                    target = %target,
+                    "crawl dropped relayed report: reachability table is full"
+                );
+                return;
+            }
             tracing::info!(
                 via = %source,
                 from = %from,
@@ -425,28 +532,22 @@ fn graph_snapshot(state: &CrawlState, now_unix_ms: u64) -> (Vec<NodeInfo>, Vec<G
     let reports = state
         .reachability
         .iter()
-        .filter_map(|message| match message {
-            RadiiMessage::ReachabilityReport {
-                from,
-                target,
-                protocol,
-                reachable,
-                rtt_ms,
-                ..
-            } => {
-                if expired.contains(from) || expired.contains(target) {
-                    None
-                } else {
-                    Some(GraphReport {
-                        from: from.clone(),
-                        target: target.clone(),
-                        protocol: protocol.clone(),
-                        reachable: *reachable,
-                        rtt_ms: *rtt_ms,
-                    })
-                }
-            }
-            _ => None,
+        .filter(|((from, target, _), entry)| {
+            // Drop an observation if either endpoint has gone quiet, or if the
+            // observation itself is stale — a peer that stopped probing should
+            // not keep a link alive in the graph indefinitely.
+            let endpoint_expired = expired.contains(from) || expired.contains(target);
+            let report_expired = state
+                .node_ttl_ms
+                .is_some_and(|ttl| now_unix_ms.saturating_sub(entry.last_seen_unix_ms) > ttl);
+            !endpoint_expired && !report_expired
+        })
+        .map(|((from, target, protocol), entry)| GraphReport {
+            from: from.clone(),
+            target: target.clone(),
+            protocol: protocol.clone(),
+            reachable: entry.reachable,
+            rtt_ms: entry.rtt_ms,
         })
         .collect();
 
@@ -456,6 +557,15 @@ fn graph_snapshot(state: &CrawlState, now_unix_ms: u64) -> (Vec<NodeInfo>, Vec<G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report_entry(last_seen_unix_ms: u64) -> ReachabilityEntry {
+        ReachabilityEntry {
+            reachable: true,
+            rtt_ms: Some(10),
+            observed_addr: None,
+            last_seen_unix_ms,
+        }
+    }
 
     fn entry(roles: Vec<&str>, last_seen_unix_ms: u64) -> NodeEntry {
         NodeEntry {
@@ -503,14 +613,10 @@ mod tests {
             .nodes
             .insert("fresh".to_string(), entry(vec![], 9_000));
         state.nodes.insert("stale".to_string(), entry(vec![], 0));
-        state.reachability.push(RadiiMessage::ReachabilityReport {
-            from: "fresh".to_string(),
-            target: "stale".to_string(),
-            protocol: "http".to_string(),
-            reachable: true,
-            rtt_ms: Some(10),
-            observed_addr: None,
-        });
+        state.record_report(
+            ("fresh".to_string(), "stale".to_string(), "http".to_string()),
+            report_entry(10_000),
+        );
 
         let (nodes, reports) = graph_snapshot(&state, 10_000);
         assert!(nodes.iter().all(|n| n.node_id != "stale"));
@@ -518,6 +624,67 @@ mod tests {
         assert!(
             reports.is_empty(),
             "report naming an expired node must be dropped"
+        );
+    }
+
+    /// The heartbeat case that used to grow the table without bound: the same
+    /// peer re-reporting the same link forever must cost exactly one entry.
+    #[test]
+    fn repeated_reports_replace_rather_than_accumulate() {
+        let mut state = CrawlState::default();
+        let key = ("a".to_string(), "b".to_string(), "http".to_string());
+        for tick in 0..1_000 {
+            assert!(state.record_report(key.clone(), report_entry(tick)));
+        }
+        assert_eq!(state.reachability.len(), 1);
+        assert_eq!(
+            state.reachability[&key].last_seen_unix_ms, 999,
+            "the newest observation should win"
+        );
+    }
+
+    /// One peer must not be able to fill the whole table and starve others.
+    #[test]
+    fn a_single_peer_cannot_exhaust_the_table() {
+        let mut state = CrawlState::default();
+        let mut accepted = 0;
+        for i in 0..(MAX_REACHABILITY_ENTRIES_PER_PEER + 500) {
+            if state.record_report(
+                ("noisy".to_string(), format!("t{i}"), "http".to_string()),
+                report_entry(0),
+            ) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_REACHABILITY_ENTRIES_PER_PEER);
+
+        // An honest peer still gets in.
+        assert!(state.record_report(
+            ("honest".to_string(), "b".to_string(), "http".to_string()),
+            report_entry(0),
+        ));
+    }
+
+    /// A stale observation must drop out of the graph even when both of its
+    /// endpoints are still sending hellos.
+    #[test]
+    fn graph_snapshot_drops_a_stale_report_between_live_nodes() {
+        let mut state = CrawlState {
+            node_ttl_ms: Some(5_000),
+            ..CrawlState::default()
+        };
+        state.nodes.insert("a".to_string(), entry(vec![], 10_000));
+        state.nodes.insert("b".to_string(), entry(vec![], 10_000));
+        state.record_report(
+            ("a".to_string(), "b".to_string(), "http".to_string()),
+            report_entry(0),
+        );
+
+        let (nodes, reports) = graph_snapshot(&state, 10_000);
+        assert_eq!(nodes.len(), 2, "both nodes are still live");
+        assert!(
+            reports.is_empty(),
+            "an observation older than the TTL must not keep a link alive"
         );
     }
 
@@ -529,14 +696,10 @@ mod tests {
         state
             .nodes
             .insert("node-b".to_string(), entry(vec!["resource"], 0));
-        state.reachability.push(RadiiMessage::ReachabilityReport {
-            from: "head".to_string(),
-            target: "node-b".to_string(),
-            protocol: "http".to_string(),
-            reachable: true,
-            rtt_ms: Some(12),
-            observed_addr: None,
-        });
+        state.record_report(
+            ("head".to_string(), "node-b".to_string(), "http".to_string()),
+            report_entry(0),
+        );
 
         let (_, reports) = graph_snapshot(&state, 0);
         assert_eq!(reports.len(), 1);
