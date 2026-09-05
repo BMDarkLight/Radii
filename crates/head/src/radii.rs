@@ -1,6 +1,6 @@
 use crate::config::RadiiConfig;
 use radii_proto::tls::TlsIdentity;
-use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage};
+use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage, RelayedMessage};
 use tokio::net::TcpListener;
 
 pub async fn maybe_run_radii(
@@ -55,9 +55,27 @@ async fn handle_connection(
 
     loop {
         let message = read_message(&mut stream).await?;
+        let relayed = match RelayedMessage::try_from(message) {
+            Ok(relayed) => relayed,
+            Err(err) => {
+                tracing::warn!(
+                    source = %source,
+                    error = %err,
+                    "radii bridge refused to relay an unsupported message"
+                );
+                write_message(
+                    &mut stream,
+                    &RadiiMessage::Ack {
+                        status: "unsupported_relay_message".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
+        };
         let wrapped = RadiiMessage::FromHead {
             source: source.to_string(),
-            message: Box::new(message),
+            message: relayed,
         };
 
         let mut conn = match upstream.take() {

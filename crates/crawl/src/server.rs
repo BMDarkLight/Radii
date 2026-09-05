@@ -1,5 +1,7 @@
 use radii_proto::tls::TlsIdentity;
-use radii_proto::{read_message, write_message, BoxedStream, GraphReport, NodeInfo, RadiiMessage};
+use radii_proto::{
+    read_message, write_message, BoxedStream, GraphReport, NodeInfo, RadiiMessage, RelayedMessage,
+};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -198,8 +200,7 @@ async fn handle_connection(
             }
             RadiiMessage::FromHead { source, message } => {
                 tracing::info!(source = %source, "crawl message via head");
-                let inner = *message;
-                handle_wrapped_message(inner, &state, source.clone()).await?;
+                handle_wrapped_message(message, &state, source.clone()).await;
                 write_message(
                     &mut stream,
                     &RadiiMessage::Ack {
@@ -225,13 +226,20 @@ async fn handle_connection(
     }
 }
 
+/// Applies a relayed message to the graph.
+///
+/// Taking a [`RelayedMessage`] rather than a `RadiiMessage` removes the
+/// catch-all arm this function used to need: the type cannot represent a
+/// nested envelope or a `GraphQuery`, so every case it can receive is handled
+/// explicitly and a new variant becomes a compile error rather than a silent
+/// no-op.
 async fn handle_wrapped_message(
-    message: RadiiMessage,
+    message: RelayedMessage,
     state: &Arc<RwLock<CrawlState>>,
     source: String,
-) -> anyhow::Result<()> {
+) {
     match message {
-        RadiiMessage::NodeHello {
+        RelayedMessage::NodeHello {
             node_id,
             roles,
             listen_addrs,
@@ -247,10 +255,10 @@ async fn handle_wrapped_message(
             );
             tracing::info!(via = %source, node = %node_id, "crawl node hello");
         }
-        RadiiMessage::ReachabilityProbe { from, to, .. } => {
+        RelayedMessage::ReachabilityProbe { from, to, .. } => {
             tracing::info!(via = %source, from = %from, to = %to, "crawl probe");
         }
-        RadiiMessage::ReachabilityReport {
+        RelayedMessage::ReachabilityReport {
             from,
             target,
             protocol,
@@ -265,7 +273,7 @@ async fn handle_wrapped_message(
                 protocol: protocol.clone(),
                 reachable,
                 rtt_ms,
-                observed_addr: observed_addr.clone(),
+                observed_addr,
             });
             tracing::info!(
                 via = %source,
@@ -276,12 +284,7 @@ async fn handle_wrapped_message(
                 "crawl report"
             );
         }
-        _ => {
-            tracing::info!(via = %source, "crawl wrapped message ignored");
-        }
     }
-
-    Ok(())
 }
 
 /// Node ids in `nodes` that are registered but haven't been heard from

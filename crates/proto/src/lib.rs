@@ -39,8 +39,11 @@ pub enum RadiiMessage {
         observed_addr: Option<String>,
     },
     FromHead {
+        /// Where the relaying Head saw the message come from — a socket
+        /// address, kept for operator logs. Free text chosen by the relaying
+        /// peer, so it is never used to authorize anything.
         source: String,
-        message: Box<RadiiMessage>,
+        message: RelayedMessage,
     },
     /// Requests the current node registry and reachability graph from Crawl.
     GraphQuery,
@@ -51,6 +54,81 @@ pub enum RadiiMessage {
     Ack {
         status: String,
     },
+}
+
+/// The subset of messages a Head may relay to Crawl on a client's behalf.
+///
+/// Deliberately *flat*. The previous shape was `Box<RadiiMessage>`, which let
+/// a `FromHead` contain another `FromHead`: postcard's derived `Deserialize`
+/// recurses once per level with no depth limit, and each level cost only two
+/// bytes on the wire, so a frame well under [`MAX_FRAME_LEN`] drove the
+/// decoder into a stack overflow — aborting the whole process rather than
+/// failing the connection. `RelayedMessage` cannot nest, so that frame is now
+/// undecodable by construction rather than by a size check that a smaller
+/// limit would only have made marginally more expensive to defeat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelayedMessage {
+    NodeHello {
+        node_id: String,
+        roles: Vec<String>,
+        listen_addrs: Vec<String>,
+    },
+    ReachabilityProbe {
+        from: String,
+        to: String,
+        sent_at_unix_ms: u64,
+    },
+    ReachabilityReport {
+        from: String,
+        target: String,
+        protocol: String,
+        reachable: bool,
+        rtt_ms: Option<u32>,
+        observed_addr: Option<String>,
+    },
+}
+
+impl TryFrom<RadiiMessage> for RelayedMessage {
+    type Error = anyhow::Error;
+
+    fn try_from(message: RadiiMessage) -> Result<Self> {
+        match message {
+            RadiiMessage::NodeHello {
+                node_id,
+                roles,
+                listen_addrs,
+            } => Ok(Self::NodeHello {
+                node_id,
+                roles,
+                listen_addrs,
+            }),
+            RadiiMessage::ReachabilityProbe {
+                from,
+                to,
+                sent_at_unix_ms,
+            } => Ok(Self::ReachabilityProbe {
+                from,
+                to,
+                sent_at_unix_ms,
+            }),
+            RadiiMessage::ReachabilityReport {
+                from,
+                target,
+                protocol,
+                reachable,
+                rtt_ms,
+                observed_addr,
+            } => Ok(Self::ReachabilityReport {
+                from,
+                target,
+                protocol,
+                reachable,
+                rtt_ms,
+                observed_addr,
+            }),
+            other => bail!("message is not relayable through a Head: {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,11 +330,54 @@ mod tests {
 
         let wrapped = RadiiMessage::FromHead {
             source: "head-1".into(),
-            message: Box::new(RadiiMessage::Ack {
-                status: "inner".into(),
-            }),
+            message: RelayedMessage::ReachabilityProbe {
+                from: "a".into(),
+                to: "b".into(),
+                sent_at_unix_ms: 7,
+            },
         };
         assert_eq!(round_trip(wrapped.clone()).await, wrapped);
+    }
+
+    /// A `FromHead` envelope must not be able to carry another `FromHead`.
+    ///
+    /// The old `Box<RadiiMessage>` shape cost two bytes per nesting level, so
+    /// a legal-sized frame carried enough levels to overflow the stack during
+    /// deserialization and abort the process. This asserts the frame is now
+    /// rejected as a decode error — and, because `RelayedMessage` is flat,
+    /// the assertion is reachable at all: the old code aborted the test
+    /// binary here instead of returning.
+    #[tokio::test]
+    async fn rejects_deeply_nested_from_head_frame() {
+        // Hand-rolled postcard: FromHead is variant 3, then an empty `source`
+        // string — the same two-bytes-per-level shape the original proof of
+        // concept used.
+        let depth = 200_000usize;
+        let mut payload = Vec::with_capacity(depth * 2 + 2);
+        for _ in 0..depth {
+            payload.push(3u8); // FromHead
+            payload.push(0u8); // source = ""
+        }
+        payload.push(6u8); // a trailing non-relayable variant
+        payload.push(0u8);
+
+        assert!(
+            payload.len() < MAX_FRAME_LEN as usize,
+            "the attack frame must be within the legal size limit to be meaningful"
+        );
+
+        let (mut client, mut server): (DuplexStream, DuplexStream) =
+            tokio::io::duplex(2 * 1024 * 1024);
+        client
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&payload).await.unwrap();
+
+        assert!(
+            read_message(&mut server).await.is_err(),
+            "a nested FromHead frame must fail to decode, not recurse"
+        );
     }
 
     #[tokio::test]

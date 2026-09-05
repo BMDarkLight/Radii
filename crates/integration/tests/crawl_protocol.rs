@@ -1,6 +1,6 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_integration::{bind_local, wait_ready};
-use radii_proto::{read_message, write_message, RadiiMessage};
+use radii_proto::{read_message, write_message, RadiiMessage, RelayedMessage};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -88,11 +88,11 @@ async fn from_head_wrapper_is_ingested() {
         &mut stream,
         &RadiiMessage::FromHead {
             source: "127.0.0.1:9".into(),
-            message: Box::new(RadiiMessage::NodeHello {
+            message: RelayedMessage::NodeHello {
                 node_id: "via-head".into(),
                 roles: vec!["resource".into()],
                 listen_addrs: vec![],
-            }),
+            },
         },
     )
     .await
