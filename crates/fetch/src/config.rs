@@ -53,6 +53,13 @@ pub struct RelayConfig {
     pub max_concurrent_per_peer: usize,
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
+    /// Bounds the entire pre-splice handshake window — from the inbound
+    /// mTLS accept through to receiving the downstream hop's ack — so a
+    /// peer that authenticates correctly and then simply never speaks
+    /// cannot hold a task and its TLS session open forever. Does not apply
+    /// once the splice begins; `idle_timeout_ms` bounds that separately.
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
     /// Empty means any peer holding a certificate from the configured CA.
     #[serde(default)]
     pub allow_peers: Vec<String>,
@@ -75,6 +82,10 @@ fn default_max_concurrent_per_peer() -> usize {
 
 fn default_idle_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_handshake_timeout_ms() -> u64 {
+    10_000
 }
 
 fn default_max_candidates() -> usize {
@@ -201,6 +212,7 @@ mod tests {
         assert_eq!(relay.max_concurrent_total, 256);
         assert_eq!(relay.max_concurrent_per_peer, 8);
         assert_eq!(relay.idle_timeout_ms, 30_000);
+        assert_eq!(relay.handshake_timeout_ms, 10_000);
         assert!(relay.allow_peers.is_empty());
     }
 

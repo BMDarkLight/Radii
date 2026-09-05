@@ -12,7 +12,35 @@ use radii_proto::tls::TlsIdentity;
 use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage, RouteHop};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
+
+/// The closed vocabulary of `Ack.status` values this relay understands,
+/// whether generated locally or received from a downstream hop.
+///
+/// A downstream hop's ack is relayed upstream, so its status cannot be
+/// passed through as opaque, attacker-controlled bytes: a compromised or
+/// merely misbehaving next hop could otherwise return up to `MAX_FRAME_LEN`
+/// of arbitrary text — newlines, ANSI escapes, anything — and have it logged
+/// verbatim by every upstream hop and the originator. The vocabulary here is
+/// closed, so an allowlist is the right shape rather than a length cap.
+const KNOWN_ACK_STATUSES: &[&str] = &[
+    "tunnel_ready",
+    "tunnel_misaddressed",
+    "tunnel_too_long",
+    "tunnel_path_loops",
+    "tunnel_hop_unreachable",
+    "relay_forwarding_unavailable",
+    "expected_tunnel_open",
+    UNKNOWN_DOWNSTREAM_STATUS,
+];
+
+/// Substituted for any `Ack.status` a downstream hop returns that is not in
+/// [`KNOWN_ACK_STATUSES`], and for any frame it returns that is not an `Ack`
+/// at all. Included in [`KNOWN_ACK_STATUSES`] itself so it survives
+/// unchanged if relayed through a further upstream hop.
+const UNKNOWN_DOWNSTREAM_STATUS: &str = "relay_downstream_status_unrecognised";
 
 pub struct RelayRuntime {
     pub config: RelayConfig,
@@ -58,11 +86,45 @@ pub async fn run(listener: TcpListener, runtime: Arc<RelayRuntime>) -> Result<()
     }
 }
 
+/// Every await before the splice is a peer waiting on this relay, or this
+/// relay waiting on some other peer — the inbound mTLS accept, the inbound
+/// `TunnelOpen`, dialing and handshaking the next hop, and its ack. None of
+/// that is bounded by anything else in the system: a peer holding a valid
+/// mesh certificate can authenticate correctly and then simply never speak
+/// again, holding a task and up to two TLS sessions open at zero cost to
+/// itself. So the whole pre-splice window is wrapped in one timeout here;
+/// the splice itself is deliberately outside it; a long-lived tunnel is
+/// legitimate; `idle_timeout_ms` bounds its idleness separately.
 async fn handle(
     stream: tokio::net::TcpStream,
     addr: SocketAddr,
     runtime: Arc<RelayRuntime>,
 ) -> Result<()> {
+    let bound = Duration::from_millis(runtime.config.handshake_timeout_ms);
+    match timeout(bound, handshake(stream, addr, Arc::clone(&runtime))).await {
+        Ok(outcome) => match outcome? {
+            Some((a, b)) => splice(a, b).await,
+            None => Ok(()),
+        },
+        Err(_elapsed) => {
+            tracing::warn!(
+                source = %addr,
+                handshake_timeout_ms = runtime.config.handshake_timeout_ms,
+                "relay handshake did not complete before its bound; dropping the connection"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Runs the whole pre-splice handshake and returns the pair of streams to
+/// splice, or `None` when the connection was refused or otherwise ends
+/// before ever reaching a splice.
+async fn handshake(
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    runtime: Arc<RelayRuntime>,
+) -> Result<Option<(BoxedStream, BoxedStream)>> {
     let (mut inbound, peer) = radii_proto::tls::accept(stream, Some(&runtime.identity)).await?;
     let peer = peer.context("relay listener requires mutual TLS")?;
 
@@ -70,13 +132,15 @@ async fn handle(
         RadiiMessage::TunnelOpen { hops } => hops,
         other => {
             tracing::warn!(source = %addr, ?other, "relay expected a TunnelOpen");
-            return refuse(&mut inbound, "expected_tunnel_open").await;
+            refuse(&mut inbound, "expected_tunnel_open").await?;
+            return Ok(None);
         }
     };
 
     if let Err(status) = validate(&hops, &runtime.config) {
         tracing::warn!(source = %addr, peer = %peer, status, "relay refused a chain");
-        return refuse(&mut inbound, status).await;
+        refuse(&mut inbound, status).await?;
+        return Ok(None);
     }
 
     if hops.len() == 1 {
@@ -127,7 +191,10 @@ async fn refuse(stream: &mut BoxedStream, status: &str) -> Result<()> {
 /// an unauthenticated originator relayed from anywhere. This function does
 /// not enforce anything about that — it is a later decision — but a terminal
 /// node MUST configure `[tunnel_tls.listener]` once forwarding is in use.
-async fn terminate(mut inbound: BoxedStream, runtime: Arc<RelayRuntime>) -> Result<()> {
+async fn terminate(
+    mut inbound: BoxedStream,
+    runtime: Arc<RelayRuntime>,
+) -> Result<Option<(BoxedStream, BoxedStream)>> {
     write_message(
         &mut inbound,
         &RadiiMessage::Ack {
@@ -147,7 +214,7 @@ async fn terminate(mut inbound: BoxedStream, runtime: Arc<RelayRuntime>) -> Resu
     let upstream =
         tokio::net::TcpStream::connect(crate::server::normalize_upstream(&runtime.upstream))
             .await?;
-    splice(e2e, Box::new(upstream)).await
+    Ok(Some((e2e, Box::new(upstream))))
 }
 
 /// This node is an intermediate hop: dial the next one, pass the tail along,
@@ -167,7 +234,7 @@ async fn forward(
     mut inbound: BoxedStream,
     hops: Vec<RouteHop>,
     runtime: Arc<RelayRuntime>,
-) -> Result<()> {
+) -> Result<Option<(BoxedStream, BoxedStream)>> {
     let Some(next) = hops.get(1) else {
         bail!("forward called with a chain shorter than two hops");
     };
@@ -188,7 +255,8 @@ async fn forward(
                 error = %err,
                 "relay could not reach the next hop"
             );
-            return refuse(&mut inbound, "tunnel_hop_unreachable").await;
+            refuse(&mut inbound, "tunnel_hop_unreachable").await?;
+            return Ok(None);
         }
     };
 
@@ -201,14 +269,36 @@ async fn forward(
     .await?;
 
     // One frame back — the terminal node's ack, or a refusal from any hop
-    // downstream — then the pipe goes opaque.
+    // downstream — then the pipe goes opaque. From here the next hop is
+    // untrusted: only an `Ack` is ever relayed upstream, and only with a
+    // status this relay recognises. Any other variant, or a status outside
+    // the closed vocabulary, becomes one fixed local code instead of being
+    // passed upstream byte-for-byte — see `KNOWN_ACK_STATUSES`. The
+    // tunnel_ready check below runs against that sanitised status, never
+    // against whatever the next hop actually sent.
     let ack = read_message(&mut outbound).await?;
-    write_message(&mut inbound, &ack).await?;
-    if !matches!(&ack, RadiiMessage::Ack { status } if status == "tunnel_ready") {
-        return Ok(());
+    let status = match ack {
+        RadiiMessage::Ack { status } if KNOWN_ACK_STATUSES.contains(&status.as_str()) => status,
+        RadiiMessage::Ack { status } => {
+            tracing::warn!(
+                next = %next.node_id,
+                status_len = status.len(),
+                "next hop returned an unrecognised ack status"
+            );
+            UNKNOWN_DOWNSTREAM_STATUS.to_string()
+        }
+        other => {
+            tracing::warn!(next = %next.node_id, ?other, "next hop returned a non-ack frame");
+            UNKNOWN_DOWNSTREAM_STATUS.to_string()
+        }
+    };
+
+    write_message(&mut inbound, &RadiiMessage::Ack { status: status.clone() }).await?;
+    if status != "tunnel_ready" {
+        return Ok(None);
     }
 
-    splice(inbound, outbound).await
+    Ok(Some((inbound, outbound)))
 }
 
 pub(crate) async fn splice(a: BoxedStream, b: BoxedStream) -> Result<()> {

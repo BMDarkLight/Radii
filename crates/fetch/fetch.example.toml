@@ -46,6 +46,7 @@ attempt_timeout_ms = 3000
 # max_concurrent_total = 256
 # max_concurrent_per_peer = 8
 # idle_timeout_ms = 30000
+# handshake_timeout_ms = 10000  # bounds the pre-splice handshake, not the tunnel itself
 # allow_peers = []              # empty = any peer with a CA-valid certificate
 #
 # [relay.tls]

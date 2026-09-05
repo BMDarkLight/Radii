@@ -39,6 +39,7 @@ async fn terminal_node_acks_and_tunnels_to_its_upstream() {
         max_concurrent_total: 16,
         max_concurrent_per_peer: 4,
         idle_timeout_ms: 30_000,
+        handshake_timeout_ms: 10_000,
         allow_peers: Vec::new(),
         tls: Some(ca.issue("node-t")),
     };
@@ -110,6 +111,7 @@ async fn rejects_a_tunnel_open_addressed_to_another_node() {
         max_concurrent_total: 16,
         max_concurrent_per_peer: 4,
         idle_timeout_ms: 30_000,
+        handshake_timeout_ms: 10_000,
         allow_peers: Vec::new(),
         tls: Some(ca.issue("node-t")),
     };
