@@ -410,6 +410,16 @@ async fn handle_connection(
             RadiiMessage::Ack { .. } => {
                 tracing::info!(source = %addr, "crawl ack");
             }
+            RadiiMessage::TunnelOpen { .. } => {
+                tracing::info!(source = %addr, "crawl tunnel open (not yet implemented)");
+                write_message(
+                    &mut stream,
+                    &RadiiMessage::Ack {
+                        status: "not_yet_implemented".to_string(),
+                    },
+                )
+                .await?;
+            }
         }
     }
 }

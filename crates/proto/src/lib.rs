@@ -10,6 +10,13 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 /// Protects listeners from unbounded allocations on a hostile length prefix.
 pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 
+/// Maximum hops in a single `TunnelOpen` path.
+///
+/// Mirrors `radii_core::routing::MAX_ROUTE_HOPS`. It is duplicated rather
+/// than imported because `radii-proto` does not depend on `radii-core`; the
+/// wire layer must bound its own input without reaching for domain types.
+pub const MAX_TUNNEL_HOPS: usize = 32;
+
 /// A connected transport, plaintext or TLS — boxing behind this trait lets
 /// connection-handling code stay transport-agnostic once the (optional) TLS
 /// handshake is done, since [`read_message`]/[`write_message`] only need
@@ -17,6 +24,16 @@ pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 pub trait AsyncDuplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncDuplex for T {}
 pub type BoxedStream = Box<dyn AsyncDuplex>;
+
+/// One hop of an initiator-pinned source route.
+///
+/// Flat by construction, like `RelayedMessage`: a hop list can never nest, so
+/// no `TunnelOpen` frame can drive the decoder into unbounded recursion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteHop {
+    pub node_id: String,
+    pub addr: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RadiiMessage {
@@ -58,6 +75,14 @@ pub enum RadiiMessage {
     },
     Ack {
         status: String,
+    },
+    /// Opens a relayed tunnel along an explicit path.
+    ///
+    /// The list always starts with the node receiving the frame: a relay
+    /// checks `hops[0]` names itself, then forwards `hops[1..]` onward. A
+    /// single-entry list means the receiver is the chain's terminal node.
+    TunnelOpen {
+        hops: Vec<RouteHop>,
     },
 }
 
@@ -298,6 +323,16 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
     let mut payload = vec![0u8; len as usize];
     reader.read_exact(&mut payload).await?;
     let message = postcard::from_bytes(&payload)?;
+
+    if let RadiiMessage::TunnelOpen { hops } = &message {
+        if hops.is_empty() || hops.len() > MAX_TUNNEL_HOPS {
+            bail!(
+                "tunnel_open hop count {} outside 1..={MAX_TUNNEL_HOPS}",
+                hops.len()
+            );
+        }
+    }
+
     Ok(message)
 }
 
@@ -544,5 +579,50 @@ mod tests {
             }
         );
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_open_round_trips() {
+        let message = RadiiMessage::TunnelOpen {
+            hops: vec![
+                RouteHop { node_id: "r1".into(), addr: "10.0.0.1:2224".into() },
+                RouteHop { node_id: "t".into(), addr: "10.0.0.2:2224".into() },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &message).await.unwrap();
+        let decoded = read_message(&mut buf.as_slice()).await.unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_tunnel_open_with_too_many_hops() {
+        let hops = (0..=MAX_TUNNEL_HOPS)
+            .map(|i| RouteHop { node_id: format!("n{i}"), addr: "127.0.0.1:1".into() })
+            .collect();
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &RadiiMessage::TunnelOpen { hops })
+            .await
+            .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("hop count"),
+            "expected a hop-count bound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_an_empty_tunnel_open() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &RadiiMessage::TunnelOpen { hops: Vec::new() })
+            .await
+            .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("hop count"), "got: {err}");
     }
 }
