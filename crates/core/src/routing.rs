@@ -129,6 +129,105 @@ pub struct RouteCandidate {
     pub score: f64,
 }
 
+/// One dialable hop of a resolved route: the node to reach, and the address
+/// the registry advertises for it.
+///
+/// The two travel together for the same reason they do on the wire: the
+/// address came from a peer-written registry and is a claim, so the node id
+/// beside it is what makes the claim checkable at handshake time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHop {
+    pub node_id: NodeId,
+    pub addr: String,
+}
+
+/// A fully resolved, dialable route.
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute {
+    /// Source excluded — the initiator does not dial itself. Never empty.
+    /// The last entry is the target.
+    pub hops: Vec<ResolvedHop>,
+    pub score: f64,
+}
+
+impl ResolvedRoute {
+    /// The final hop. Infallible: `resolve_candidates` never emits an empty
+    /// `hops`, which is the type's construction invariant.
+    pub fn target(&self) -> &NodeId {
+        &self
+            .hops
+            .last()
+            .expect("ResolvedRoute::hops is non-empty by construction")
+            .node_id
+    }
+
+    fn node_sequence(&self) -> Vec<NodeId> {
+        self.hops.iter().map(|hop| hop.node_id.clone()).collect()
+    }
+}
+
+/// Plans to every target, resolves each hop to a dialable address, and returns
+/// the best `limit` routes across all of them in ascending score order.
+///
+/// A route whose *intermediate* hop has no registered listen address is
+/// dropped rather than returned: intermediates are now dialed, not merely
+/// counted, so an unresolvable one makes the whole route unusable.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_candidates(
+    snapshot: &GraphSnapshot,
+    listen_addrs: &HashMap<String, Vec<String>>,
+    source: &NodeId,
+    targets: &[NodeId],
+    allowed_protocols: &[ProtocolId],
+    max_hops: usize,
+    limit: usize,
+) -> Vec<ResolvedRoute> {
+    let planner = RoutePlanner::new(DefaultScorer);
+    let mut resolved: Vec<ResolvedRoute> = Vec::new();
+
+    for target in targets {
+        let request = RouteRequest {
+            source: source.clone(),
+            target: target.clone(),
+            allowed_protocols: allowed_protocols.to_vec(),
+            max_hops,
+        };
+
+        for candidate in planner.plan(snapshot, &request, limit) {
+            // `candidate.hops` starts at the source; skip it.
+            let mut hops = Vec::with_capacity(candidate.hops.len().saturating_sub(1));
+            let mut dialable = true;
+            for node in candidate.hops.iter().skip(1) {
+                match listen_addrs.get(&node.0).and_then(|addrs| addrs.first()) {
+                    Some(addr) => hops.push(ResolvedHop {
+                        node_id: node.clone(),
+                        addr: addr.clone(),
+                    }),
+                    None => {
+                        dialable = false;
+                        break;
+                    }
+                }
+            }
+
+            if !dialable || hops.is_empty() {
+                continue;
+            }
+
+            resolved.push(ResolvedRoute {
+                hops,
+                score: candidate.score,
+            });
+        }
+    }
+
+    resolved.sort_by(|a, b| a.score.total_cmp(&b.score));
+    let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
+    resolved.retain(|route| seen.insert(route.node_sequence()));
+    resolved.truncate(limit);
+    resolved
+}
+
 /// Cost model for traversing a single link.
 ///
 /// The contract is what makes planning tractable: the cost must be
@@ -476,6 +575,13 @@ mod tests {
         }
     }
 
+    fn addrs(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(node, addr)| ((*node).to_string(), vec![(*addr).to_string()]))
+            .collect()
+    }
+
     #[test]
     fn plans_lowest_score_path() {
         let snapshot = GraphSnapshot::from_reports([
@@ -678,5 +784,124 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn resolves_candidates_across_targets_in_score_order() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "t1", "radii", 100),
+            report("s", "t2", "radii", 10),
+        ]);
+        let listen = addrs(&[("t1", "10.0.0.1:9000"), ("t2", "10.0.0.2:9000")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t1".into()), NodeId("t2".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+        );
+
+        assert_eq!(routes.len(), 2);
+        // t2 is cheaper, so it must rank first even though t1 was listed first.
+        assert_eq!(routes[0].target().0, "t2");
+        assert_eq!(routes[0].hops.len(), 1);
+        assert_eq!(routes[0].hops[0].addr, "10.0.0.2:9000");
+        assert!(routes[0].score <= routes[1].score);
+    }
+
+    #[test]
+    fn excludes_the_source_and_resolves_every_intermediate_hop() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "r", "radii", 10),
+            report("r", "t", "radii", 10),
+        ]);
+        let listen = addrs(&[("r", "10.0.0.9:7000"), ("t", "10.0.0.5:9000")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+        );
+
+        assert_eq!(routes.len(), 1);
+        let hops: Vec<&str> = routes[0].hops.iter().map(|h| h.node_id.0.as_str()).collect();
+        assert_eq!(hops, vec!["r", "t"], "source must not appear in the dial list");
+        assert_eq!(routes[0].hops[0].addr, "10.0.0.9:7000");
+    }
+
+    #[test]
+    fn drops_routes_whose_intermediate_hop_has_no_listen_address() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "r", "radii", 10),
+            report("r", "t", "radii", 10),
+        ]);
+        // `r` is absent from the registry, so the two-hop route is undialable.
+        let listen = addrs(&[("t", "10.0.0.5:9000")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+        );
+
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn dedupes_identical_node_sequences_and_respects_limit() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "a", "radii", 10),
+            report("s", "b", "radii", 20),
+            report("a", "t", "radii", 10),
+            report("b", "t", "radii", 10),
+        ]);
+        let listen = addrs(&[
+            ("a", "10.0.0.1:7000"),
+            ("b", "10.0.0.2:7000"),
+            ("t", "10.0.0.5:9000"),
+        ]);
+
+        // The same target listed twice must not produce duplicate candidates.
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into()), NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            1,
+        );
+
+        assert_eq!(routes.len(), 1, "limit must truncate after dedupe");
+        assert_eq!(routes[0].hops[0].node_id.0, "a", "cheaper path wins");
+    }
+
+    #[test]
+    fn returns_empty_when_no_target_is_reachable() {
+        let snapshot = GraphSnapshot::from_reports([report("s", "a", "radii", 10)]);
+        let listen = addrs(&[("a", "10.0.0.1:7000")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("absent".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+        );
+
+        assert!(routes.is_empty());
     }
 }
