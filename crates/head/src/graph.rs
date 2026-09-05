@@ -60,6 +60,13 @@ async fn fetch_once(
             latency_ms: report.rtt_ms,
         });
     }
+    if snapshot.dropped_links() > 0 {
+        tracing::warn!(
+            upstream = %crawl_upstream,
+            dropped = snapshot.dropped_links(),
+            "crawl graph exceeded the local size cap; routing from a partial view"
+        );
+    }
     let listen_addrs = nodes
         .into_iter()
         .map(|node| (node.node_id, node.listen_addrs))
