@@ -88,6 +88,7 @@ async fn from_head_wrapper_is_ingested() {
         &mut stream,
         &RadiiMessage::FromHead {
             source: "127.0.0.1:9".into(),
+            client_identity: None,
             message: RelayedMessage::NodeHello {
                 node_id: "via-head".into(),
                 roles: vec!["resource".into()],

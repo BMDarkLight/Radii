@@ -43,6 +43,11 @@ pub enum RadiiMessage {
         /// address, kept for operator logs. Free text chosen by the relaying
         /// peer, so it is never used to authorize anything.
         source: String,
+        /// The mTLS-authenticated node id of the client the Head relayed
+        /// for, or `None` when the Head's bridge listener is plaintext and
+        /// there was no identity to authenticate. Crawl authorizes the inner
+        /// claim against *this*, not against `source`.
+        client_identity: Option<String>,
         message: RelayedMessage,
     },
     /// Requests the current node registry and reachability graph from Crawl.
@@ -86,6 +91,19 @@ pub enum RelayedMessage {
         rtt_ms: Option<u32>,
         observed_addr: Option<String>,
     },
+}
+
+impl RelayedMessage {
+    /// The node id this message speaks for, which Crawl authorizes against
+    /// the relayed client identity. A `ReachabilityProbe` only produces a log
+    /// line and writes no state, so it claims nothing to check.
+    pub fn claimed_node_id(&self) -> Option<&str> {
+        match self {
+            Self::NodeHello { node_id, .. } => Some(node_id),
+            Self::ReachabilityReport { from, .. } => Some(from),
+            Self::ReachabilityProbe { .. } => None,
+        }
+    }
 }
 
 impl TryFrom<RadiiMessage> for RelayedMessage {
@@ -330,6 +348,7 @@ mod tests {
 
         let wrapped = RadiiMessage::FromHead {
             source: "head-1".into(),
+            client_identity: Some("node-a".into()),
             message: RelayedMessage::ReachabilityProbe {
                 from: "a".into(),
                 to: "b".into(),
@@ -350,13 +369,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_deeply_nested_from_head_frame() {
         // Hand-rolled postcard: FromHead is variant 3, then an empty `source`
-        // string — the same two-bytes-per-level shape the original proof of
-        // concept used.
+        // string, then a `None` client_identity — the same two-bytes-per-level
+        // shape the original proof of concept used, plus the new field.
         let depth = 200_000usize;
-        let mut payload = Vec::with_capacity(depth * 2 + 2);
+        let mut payload = Vec::with_capacity(depth * 3 + 2);
         for _ in 0..depth {
             payload.push(3u8); // FromHead
             payload.push(0u8); // source = ""
+            payload.push(0u8); // client_identity = None
         }
         payload.push(6u8); // a trailing non-relayable variant
         payload.push(0u8);

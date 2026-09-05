@@ -19,7 +19,8 @@ async fn crawl_drops_oversized_client_frame() {
     use radii_integration::{bind_local, wait_ready};
 
     let (listener, addr) = bind_local().await.unwrap();
-    let handle = tokio::spawn(async move { run_on(listener, None, None).await });
+    let handle =
+        tokio::spawn(async move { run_on(listener, None, None, Default::default()).await });
     wait_ready(&addr).await.unwrap();
 
     let mut stream = TcpStream::connect(&addr).await.unwrap();

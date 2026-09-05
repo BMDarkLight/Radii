@@ -6,6 +6,17 @@ bind = "0.0.0.0:7100"
 # well under this value.
 # node_ttl_ms = 60000
 
+# Optional: authenticated node ids allowed to relay FromHead envelopes —
+# in practice, the Head deployments in front of this Crawl. Relaying is the
+# right to submit hellos and reports under an identity that is not your own,
+# so it is granted deliberately rather than inherited from holding a
+# CA-issued certificate. Defaults to empty: no peer may relay.
+#
+# Only enforced on mTLS connections. A plaintext listener has no peer
+# identity to match against and stays unauthenticated, exactly as direct
+# messages do — see SECURITY.md.
+# relay_peers = ["head-1"]
+
 # Optional: require mutual TLS on this listener. When configured, every
 # connection (from Head's bridge, radii-cli, or other peers) must present a
 # certificate signed by `ca`; connections without one are rejected during the

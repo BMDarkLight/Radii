@@ -24,6 +24,10 @@ pub struct CrawlState {
     /// via `CrawlState::default()`). `Some(ttl)` drops a node from
     /// `GraphQuery` replies once `now - last_seen_unix_ms > ttl`.
     pub node_ttl_ms: Option<u64>,
+    /// Authenticated node ids allowed to relay `FromHead` envelopes. Empty
+    /// (the default) means nobody may relay over an authenticated
+    /// connection. See `Config::relay_peers`.
+    pub relay_peers: HashSet<String>,
 }
 
 fn now_unix_ms() -> u64 {
@@ -37,19 +41,27 @@ pub async fn run(
     bind: &str,
     tls: Option<TlsIdentity>,
     node_ttl_ms: Option<u64>,
+    relay_peers: HashSet<String>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, tls = tls.is_some(), "crawl listening");
-    run_on(listener, tls, node_ttl_ms).await
+    tracing::info!(
+        %bind,
+        tls = tls.is_some(),
+        relay_peers = relay_peers.len(),
+        "crawl listening"
+    );
+    run_on(listener, tls, node_ttl_ms, relay_peers).await
 }
 
 pub async fn run_on(
     listener: TcpListener,
     tls: Option<TlsIdentity>,
     node_ttl_ms: Option<u64>,
+    relay_peers: HashSet<String>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(RwLock::new(CrawlState {
         node_ttl_ms,
+        relay_peers,
         ..CrawlState::default()
     }));
     run_on_with_state(listener, state, tls).await
@@ -87,6 +99,40 @@ pub async fn run_on_with_state(
 fn authorized(peer_identity: &Option<String>, claimed_node_id: &str) -> bool {
     match peer_identity {
         Some(identity) => identity == claimed_node_id,
+        None => true,
+    }
+}
+
+/// Whether an authenticated peer may relay `FromHead` envelopes at all.
+///
+/// Relaying is the right to speak for *other* nodes, so it is granted by
+/// operator configuration rather than inferred. In particular it cannot be
+/// inferred from a peer's advertised roles: roles arrive in that peer's own
+/// `NodeHello`, so a peer claiming `roles = ["head"]` is asserting the very
+/// thing being checked. Plaintext connections have no identity to match and
+/// keep today's unauthenticated behavior, like direct messages do.
+fn authorized_relay_peer(peer_identity: &Option<String>, relay_peers: &HashSet<String>) -> bool {
+    match peer_identity {
+        Some(identity) => relay_peers.contains(identity),
+        None => true,
+    }
+}
+
+/// Whether a relayed message's inner claim is backed by the identity the Head
+/// authenticated for its own client.
+///
+/// The envelope's `source` field is free text chosen by the relaying peer and
+/// is deliberately not consulted. On an authenticated connection the claim
+/// must match `client_identity`, which means an unauthenticated bridge client
+/// (`client_identity: None`) cannot write state through a Head — end-to-end
+/// authentication is required, not just Head-to-Crawl authentication.
+fn authorized_relayed_claim(
+    peer_identity: &Option<String>,
+    client_identity: &Option<String>,
+    claimed_node_id: &str,
+) -> bool {
+    match peer_identity {
+        Some(_) => client_identity.as_deref() == Some(claimed_node_id),
         None => true,
     }
 }
@@ -198,8 +244,54 @@ async fn handle_connection(
                 )
                 .await?;
             }
-            RadiiMessage::FromHead { source, message } => {
-                tracing::info!(source = %source, "crawl message via head");
+            RadiiMessage::FromHead {
+                source,
+                client_identity,
+                message,
+            } => {
+                let relay_allowed = {
+                    let guard = state.read().await;
+                    authorized_relay_peer(&peer_identity, &guard.relay_peers)
+                };
+                if !relay_allowed {
+                    tracing::warn!(
+                        source = %addr,
+                        peer = ?peer_identity,
+                        via = %source,
+                        "crawl rejected relay: peer is not a configured relay_peer"
+                    );
+                    write_message(
+                        &mut stream,
+                        &RadiiMessage::Ack {
+                            status: "unauthorized_relay_peer".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if let Some(claimed) = message.claimed_node_id() {
+                    if !authorized_relayed_claim(&peer_identity, &client_identity, claimed) {
+                        tracing::warn!(
+                            source = %addr,
+                            peer = ?peer_identity,
+                            client = ?client_identity,
+                            claimed = %claimed,
+                            "crawl rejected relayed message: claim does not match the \
+                             identity the head authenticated for its client"
+                        );
+                        write_message(
+                            &mut stream,
+                            &RadiiMessage::Ack {
+                                status: "unauthorized_node_id".to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+
+                tracing::info!(source = %source, client = ?client_identity, "crawl message via head");
                 handle_wrapped_message(message, &state, source.clone()).await;
                 write_message(
                     &mut stream,
@@ -226,13 +318,15 @@ async fn handle_connection(
     }
 }
 
-/// Applies a relayed message to the graph.
+/// Applies an already-authorized relayed message to the graph.
 ///
-/// Taking a [`RelayedMessage`] rather than a `RadiiMessage` removes the
-/// catch-all arm this function used to need: the type cannot represent a
-/// nested envelope or a `GraphQuery`, so every case it can receive is handled
-/// explicitly and a new variant becomes a compile error rather than a silent
-/// no-op.
+/// Authorization happens at the call site, against the connection's peer
+/// identity and the envelope's `client_identity`; this function assumes that
+/// check has passed. Taking a [`RelayedMessage`] rather than a
+/// `RadiiMessage` is what keeps the two in step — the type cannot represent a
+/// nested envelope or a `GraphQuery`, so there is no catch-all arm here that
+/// could silently grow a new unauthorized path the way the previous
+/// `_ => {}` did.
 async fn handle_wrapped_message(
     message: RelayedMessage,
     state: &Arc<RwLock<CrawlState>>,

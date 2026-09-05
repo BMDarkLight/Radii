@@ -27,9 +27,9 @@ pub async fn run_radii_on(
         let tls = tls.clone();
         tokio::spawn(async move {
             let result = async {
-                let (stream, _peer_identity) =
+                let (stream, peer_identity) =
                     radii_proto::tls::accept(raw_stream, tls.as_ref()).await?;
-                handle_connection(stream, upstream, addr, tls).await
+                handle_connection(stream, upstream, addr, tls, peer_identity).await
             }
             .await;
             if let Err(err) = result {
@@ -45,11 +45,18 @@ pub async fn run_radii_on(
 /// sends anything never costs Crawl a session) and transparently
 /// re-established if Crawl drops or restarts. When `tls` is configured, both
 /// the inbound bridge listener and the outbound dial to Crawl require mTLS.
+///
+/// `client_identity` is the mTLS-authenticated node id of the bridge client,
+/// forwarded to Crawl in every envelope. Head does not decide what that
+/// client may claim — Crawl does, by matching the claim against this identity
+/// — but Head must report it truthfully, which is why it is taken from the
+/// handshake rather than from anything the client sends.
 async fn handle_connection(
     mut stream: BoxedStream,
     crawl_upstream: String,
     source: std::net::SocketAddr,
     tls: Option<TlsIdentity>,
+    client_identity: Option<String>,
 ) -> anyhow::Result<()> {
     let mut upstream: Option<BoxedStream> = None;
 
@@ -75,6 +82,7 @@ async fn handle_connection(
         };
         let wrapped = RadiiMessage::FromHead {
             source: source.to_string(),
+            client_identity: client_identity.clone(),
             message: relayed,
         };
 
