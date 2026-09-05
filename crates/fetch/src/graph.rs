@@ -1,7 +1,5 @@
 use crate::config::GraphConfig;
-use radii_core::routing::{
-    DefaultScorer, GraphSnapshot, Link, NodeId, ProtocolId, RoutePlanner, RouteRequest,
-};
+use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -108,19 +106,21 @@ async fn resolve_once(
         .map(|node| (node.node_id, node.listen_addrs))
         .collect();
 
-    let planner = RoutePlanner::new(DefaultScorer);
-    let request = RouteRequest {
-        source: source.clone(),
-        target: target.clone(),
-        allowed_protocols: allowed_protocols.to_vec(),
+    let route = radii_core::routing::resolve_candidates(
+        &snapshot,
+        &listen_addrs,
+        source,
+        std::slice::from_ref(target),
+        allowed_protocols,
         max_hops,
-    };
-    let Some(route) = planner.plan(&snapshot, &request, 1).into_iter().next() else {
-        return Ok(None);
-    };
-    let Some(addr) = listen_addrs.get(&target.0).and_then(|addrs| addrs.first()) else {
-        return Ok(None);
-    };
+        1,
+    )
+    .into_iter()
+    .next();
 
-    Ok(Some((addr.clone(), route.hops.len(), route.score)))
+    let Some(route) = route else {
+        return Ok(None);
+    };
+    let addr = route.hops.last().expect("non-empty hops").addr.clone();
+    Ok(Some((addr, route.hops.len() + 1, route.score)))
 }

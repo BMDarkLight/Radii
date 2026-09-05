@@ -1,7 +1,5 @@
 use crate::config::GraphConfig;
-use radii_core::routing::{
-    DefaultScorer, GraphSnapshot, Link, NodeId, ProtocolId, RoutePlanner, RouteRequest,
-};
+use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -84,19 +82,21 @@ pub fn plan_backend(
     max_hops: usize,
 ) -> Option<(String, usize, f64)> {
     let guard = state.read().ok()?;
-    let planner = RoutePlanner::new(DefaultScorer);
-    let request = RouteRequest {
-        source: source.clone(),
-        target: target.clone(),
-        allowed_protocols: allowed_protocols.to_vec(),
+    let route = radii_core::routing::resolve_candidates(
+        &guard.snapshot,
+        &guard.listen_addrs,
+        source,
+        std::slice::from_ref(target),
+        allowed_protocols,
         max_hops,
-    };
-    let route = planner
-        .plan(&guard.snapshot, &request, 1)
-        .into_iter()
-        .next()?;
-    let addr = guard.listen_addrs.get(&target.0)?.first()?.clone();
-    Some((addr, route.hops.len(), route.score))
+        1,
+    )
+    .into_iter()
+    .next()?;
+
+    let addr = route.hops.last()?.addr.clone();
+    // `hops` excludes the source; the old contract counted it.
+    Some((addr, route.hops.len() + 1, route.score))
 }
 
 #[cfg(test)]
