@@ -10,7 +10,7 @@
 //!
 //! See `docs/tls.md` for how to provision a CA and per-node certificates.
 
-use crate::BoxedStream;
+use crate::{AsyncDuplex, BoxedStream};
 use anyhow::{bail, Context, Result};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -148,10 +148,20 @@ pub async fn accept(
     stream: TcpStream,
     identity: Option<&TlsIdentity>,
 ) -> Result<(BoxedStream, Option<String>)> {
+    accept_on(stream, identity).await
+}
+
+/// Like [`accept`], but upgrades an already-established stream. This is what
+/// lets a chain's terminal node run its end-to-end session inside the
+/// hop-local one it is already speaking.
+pub async fn accept_on<S: AsyncDuplex + 'static>(
+    stream: S,
+    identity: Option<&TlsIdentity>,
+) -> Result<(BoxedStream, Option<String>)> {
     match identity {
         Some(identity) => {
             let tls_stream = identity.acceptor().accept(stream).await?;
-            let peer = client_identity(&tls_stream)?;
+            let peer = client_identity_of(&tls_stream)?;
             Ok((Box::new(tls_stream), Some(peer)))
         }
         None => Ok((Box::new(stream), None)),
@@ -183,15 +193,37 @@ pub async fn dial_expecting(
     expected_node_id: Option<&str>,
 ) -> Result<BoxedStream> {
     let stream = TcpStream::connect(addr).await?;
+    connect_on(stream, addr, identity, expected_node_id).await
+}
+
+/// Like [`dial_expecting`], but over an already-established stream.
+///
+/// `sni_addr` supplies the server name for the handshake. A nested session
+/// has no socket address of its own to derive one from, so the caller passes
+/// the address of the host it believes it is reaching — the target hop's
+/// advertised address — and certificate SANs are checked against that real
+/// host, exactly as on a direct dial.
+///
+/// The `expected_node_id` check applies only when TLS is actually in use: on
+/// a plaintext stream there is no certificate to check, and callers get
+/// today's unauthenticated behavior (see `SECURITY.md` — plaintext listeners
+/// are documented as untrusted-network-unsafe).
+pub async fn connect_on<S: AsyncDuplex + 'static>(
+    stream: S,
+    sni_addr: &str,
+    identity: Option<&TlsIdentity>,
+    expected_node_id: Option<&str>,
+) -> Result<BoxedStream> {
     match identity {
         Some(identity) => {
-            let server_name = server_name_for_addr(addr)?;
+            let server_name = server_name_for_addr(sni_addr)?;
             let tls_stream = identity.connector().connect(server_name, stream).await?;
             if let Some(expected) = expected_node_id {
-                let actual = server_identity(&tls_stream)?;
+                let actual = server_identity_of(&tls_stream)?;
                 if actual != expected {
                     bail!(
-                        "upstream {addr} authenticated as node {actual:?}, expected {expected:?}"
+                        "upstream {sni_addr} authenticated as node {actual:?}, expected \
+                         {expected:?}"
                     );
                 }
             }
@@ -200,10 +232,10 @@ pub async fn dial_expecting(
         None => {
             if let Some(expected) = expected_node_id {
                 tracing::warn!(
-                    %addr,
+                    sni_addr = %sni_addr,
                     expected_node_id = %expected,
-                    "dialing a graph-resolved address without TLS: cannot verify the \
-                     peer is the intended node"
+                    "opening a connection without TLS: cannot verify the peer is the \
+                     intended node"
                 );
             }
             Ok(Box::new(stream))
@@ -211,7 +243,7 @@ pub async fn dial_expecting(
     }
 }
 
-fn client_identity(stream: &TlsServerStream) -> Result<String> {
+fn client_identity_of<S>(stream: &tokio_rustls::server::TlsStream<S>) -> Result<String> {
     let certs = stream
         .get_ref()
         .1
@@ -225,7 +257,7 @@ fn client_identity(stream: &TlsServerStream) -> Result<String> {
 
 /// The authenticated node identity of the *server* on an outbound TLS
 /// connection, taken from its leaf certificate's Subject CN.
-fn server_identity(stream: &TlsClientStream) -> Result<String> {
+fn server_identity_of<S>(stream: &tokio_rustls::client::TlsStream<S>) -> Result<String> {
     let certs = stream
         .get_ref()
         .1
@@ -384,6 +416,47 @@ mod tests {
             dial_result.is_err() || server_result.is_err(),
             "expected the handshake to fail for a peer signed by an untrusted CA"
         );
+    }
+
+    /// Two TLS sessions nested over one TCP connection: the outer pair is the
+    /// hop-local session, the inner pair is the end-to-end session a relay
+    /// would carry as opaque bytes.
+    #[tokio::test]
+    async fn tls_nests_over_an_established_stream() {
+        let pki = test_pki();
+        let server_identity = TlsIdentity::load(&pki.node_a).unwrap();
+        let client_identity = TlsIdentity::load(&pki.node_b).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_identity_for_inner = server_identity.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (outer, _) = accept(stream, Some(&server_identity)).await.unwrap();
+            let (mut inner, peer) = accept_on(outer, Some(&server_identity_for_inner))
+                .await
+                .unwrap();
+            assert_eq!(peer.as_deref(), Some("node-b"));
+            let mut buf = [0u8; 5];
+            inner.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outer = dial_expecting(&addr.to_string(), Some(&client_identity), Some("node-a"))
+            .await
+            .unwrap();
+        let mut inner = connect_on(
+            outer,
+            &addr.to_string(),
+            Some(&client_identity),
+            Some("node-a"),
+        )
+        .await
+        .unwrap();
+        inner.write_all(b"hello").await.unwrap();
+
+        assert_eq!(&server.await.unwrap(), b"hello");
     }
 
     #[tokio::test]
