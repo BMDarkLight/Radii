@@ -2,7 +2,7 @@
 
 Radii is a **network runtime**. Compromises in protocol handling, peer trust, or deployment hygiene can become remote code execution, traffic hijacking, or widespread denial of service. This document defines how we think about security, what is and is not safe today, how to report issues, and how operators should deploy Radii.
 
-> **Status honesty:** Radii is an early foundation. Peer authentication and transport encryption now exist as opt-in mutual TLS (see [`docs/tls.md`](docs/tls.md)), but several critical controls are still **not implemented**: TLS is not mandatory by default, replay protection, full authorization (Head-relayed messages), and rate limiting are all still gaps. Do **not** expose Crawl, Head Radii bridges, or Fetch tunnels to untrusted networks without either enabling `[tls]` everywhere it's reachable or additional controls in front of them.
+> **Status honesty:** Radii is an early foundation. Peer authentication and transport encryption now exist as opt-in mutual TLS (see [`docs/tls.md`](docs/tls.md)), and authorization now covers Head-relayed messages as well as direct ones. Several critical controls are still **not implemented**: TLS is not mandatory by default, and replay protection, connection timeouts, and rate limiting are all still gaps. Do **not** expose Crawl, Head Radii bridges, or Fetch tunnels to untrusted networks without either enabling `[tls]` everywhere it's reachable or additional controls in front of them.
 
 ---
 
@@ -119,7 +119,10 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Decision isolation | `radii-head` | Routing decision is config-driven; no remote code execution path in decision JSON |
 | CI lint/tests/audit | `.github/workflows` | Format, Clippy, tests, `cargo audit`, `cargo deny` |
 | Mutual TLS (opt-in) | `radii-proto::tls`, wired into `radii-crawl`, `radii-head`, `radii-fetch`, `radii-cli` | Peer-authenticated, encrypted transport for the Radii control protocol (Crawl's listener, Head↔Crawl bridge, graph queries) and optionally Fetch's tunnel data path, when a `[tls]` / `[tunnel_tls]` section is configured. Private-CA model, not the public Web PKI. See [`docs/tls.md`](docs/tls.md). |
-| Route authorization by peer identity | `radii-crawl` | When TLS is enabled, a peer may only submit `NodeHello` / `ReachabilityReport` under its own authenticated node id — direct connections only, see limitation below |
+| Route authorization by peer identity | `radii-crawl` | When TLS is enabled, a peer may only submit `NodeHello` / `ReachabilityReport` under its own authenticated node id |
+| Relay authorization | `radii-crawl` (`relay_peers`), `radii-head` | `FromHead` envelopes are accepted only from node ids the operator lists in `relay_peers` (default: none), and the inner claim must match the identity Head authenticated for its own bridge client — so a Head cannot launder a spoofed node id, and a peer that is not a configured Head cannot relay at all |
+| Non-recursive relay envelope | `radii-proto` (`RelayedMessage`) | `FromHead` carries a flat message type rather than a boxed `RadiiMessage`, so a nested envelope cannot drive the deserializer into a stack overflow (which aborted the process, not just the connection) |
+| Upstream node verification | `radii-fetch`, `radii-proto` (`tls::dial_expecting`) | When Fetch dials a graph-resolved upstream over mTLS, the peer's certificate CN must match the node id the route was planned to — a poisoned `listen_addrs` cannot silently redirect the tunnel to another CA-issued host |
 
 ### What is NOT implemented (treat as known gaps)
 
@@ -127,9 +130,11 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 |---|---|
 | Peer authentication / mutual TLS is opt-in, not mandatory | Any listener without `[tls]` configured stays plaintext and unauthenticated — anyone who can connect can inject Crawl hellos/reports |
 | No message signing or anti-replay | An authenticated peer (with or without TLS) can still resend its own old, valid-but-stale reports — mTLS proves who sent a message, not when it was generated |
-| Route authorization doesn't cover Head-relayed messages | Crawl authorizes the direct peer on a connection, not the original client behind Head's `FromHead` bridge — a compromised Head can inject reports under any node id |
+| A configured relay peer is still trusted to report its clients' identities honestly | Crawl checks that a `FromHead` claim matches the `client_identity` the Head asserts, but that assertion is the Head's word. A *compromised* Head (one whose private key an attacker holds) can still relay any claim it likes for a client it invents. Relay rights are therefore a trust grant: list only Heads you operate |
 | No authorization on Head HTTP | Information disclosure of backend maps via decision JSON |
+| No connection timeouts | No deadline on TLS handshakes, idle sessions, or upstream dials — connections that never make progress hold a task and a socket indefinitely |
 | No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch, TLS-authenticated or not |
+| Unbounded graph state | Crawl's reachability log only ever grows, and route planning over a dense graph is super-linear — a peer permitted to report can drive memory and CPU up with a modest number of messages |
 | Fetch is an open TCP tunnel to configured upstream | Misbind + exposure ≈ proxy to internal services |
 | No sandboxing of protocol workers | A memory-safety bug would be process-wide (Rust reduces but does not eliminate risk) |
 | Logs may include client IPs and hosts | Privacy / compliance exposure |
