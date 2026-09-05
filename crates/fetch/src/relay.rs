@@ -239,12 +239,9 @@ async fn forward(
         bail!("forward called with a chain shorter than two hops");
     };
 
-    let outbound = radii_proto::tls::dial_expecting(
-        &next.addr,
-        Some(&runtime.identity),
-        Some(&next.node_id),
-    )
-    .await;
+    let outbound =
+        radii_proto::tls::dial_expecting(&next.addr, Some(&runtime.identity), Some(&next.node_id))
+            .await;
 
     let mut outbound = match outbound {
         Ok(stream) => stream,
@@ -293,7 +290,13 @@ async fn forward(
         }
     };
 
-    write_message(&mut inbound, &RadiiMessage::Ack { status: status.clone() }).await?;
+    write_message(
+        &mut inbound,
+        &RadiiMessage::Ack {
+            status: status.clone(),
+        },
+    )
+    .await?;
     if status != "tunnel_ready" {
         return Ok(None);
     }

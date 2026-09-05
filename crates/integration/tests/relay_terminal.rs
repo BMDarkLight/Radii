@@ -10,7 +10,9 @@ use tokio::net::TcpListener;
 
 async fn run_echo(listener: TcpListener) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { break };
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             while let Ok(n) = stream.read(&mut buf).await {
@@ -44,12 +46,9 @@ async fn terminal_node_acks_and_tunnels_to_its_upstream() {
         tls: Some(ca.issue("node-t")),
     };
 
-    let runtime = radii_fetch::relay::RelayRuntime::new(
-        config,
-        echo_addr.to_string(),
-        Some(tunnel_identity),
-    )
-    .unwrap();
+    let runtime =
+        radii_fetch::relay::RelayRuntime::new(config, echo_addr.to_string(), Some(tunnel_identity))
+            .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
     wait_ready(&relay_addr).await.unwrap();
 

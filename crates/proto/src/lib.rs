@@ -585,8 +585,14 @@ mod tests {
     async fn tunnel_open_round_trips() {
         let message = RadiiMessage::TunnelOpen {
             hops: vec![
-                RouteHop { node_id: "r1".into(), addr: "10.0.0.1:2224".into() },
-                RouteHop { node_id: "t".into(), addr: "10.0.0.2:2224".into() },
+                RouteHop {
+                    node_id: "r1".into(),
+                    addr: "10.0.0.1:2224".into(),
+                },
+                RouteHop {
+                    node_id: "t".into(),
+                    addr: "10.0.0.2:2224".into(),
+                },
             ],
         };
 
@@ -600,7 +606,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_tunnel_open_with_too_many_hops() {
         let hops = (0..=MAX_TUNNEL_HOPS)
-            .map(|i| RouteHop { node_id: format!("n{i}"), addr: "127.0.0.1:1".into() })
+            .map(|i| RouteHop {
+                node_id: format!("n{i}"),
+                addr: "127.0.0.1:1".into(),
+            })
             .collect();
 
         let mut buf = Vec::new();

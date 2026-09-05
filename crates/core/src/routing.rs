@@ -831,8 +831,16 @@ mod tests {
         );
 
         assert_eq!(routes.len(), 1);
-        let hops: Vec<&str> = routes[0].hops.iter().map(|h| h.node_id.0.as_str()).collect();
-        assert_eq!(hops, vec!["r", "t"], "source must not appear in the dial list");
+        let hops: Vec<&str> = routes[0]
+            .hops
+            .iter()
+            .map(|h| h.node_id.0.as_str())
+            .collect();
+        assert_eq!(
+            hops,
+            vec!["r", "t"],
+            "source must not appear in the dial list"
+        );
         assert_eq!(routes[0].hops[0].addr, "10.0.0.9:7000");
     }
 

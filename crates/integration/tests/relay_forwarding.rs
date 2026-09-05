@@ -11,7 +11,9 @@ use tokio::net::TcpListener;
 
 async fn run_echo(listener: TcpListener) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { break };
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             while let Ok(n) = stream.read(&mut buf).await {
@@ -68,10 +70,9 @@ async fn a_two_hop_chain_carries_bytes_end_to_end() {
     wait_ready(&t_addr).await.unwrap();
     wait_ready(&r_addr).await.unwrap();
 
-    let mut hop =
-        radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
-            .await
-            .unwrap();
+    let mut hop = radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
+        .await
+        .unwrap();
 
     write_message(
         &mut hop,
@@ -98,9 +99,10 @@ async fn a_two_hop_chain_carries_bytes_end_to_end() {
 
     // The end-to-end identity check binds to the TARGET, not to the relay we
     // actually dialed. This is the property that makes an opaque relay safe.
-    let mut e2e = radii_proto::tls::connect_on(hop, &t_addr, Some(&client_identity), Some("node-t"))
-        .await
-        .unwrap();
+    let mut e2e =
+        radii_proto::tls::connect_on(hop, &t_addr, Some(&client_identity), Some("node-t"))
+            .await
+            .unwrap();
 
     e2e.write_all(b"through").await.unwrap();
     let mut buf = [0u8; 7];
@@ -122,10 +124,9 @@ async fn rejects_a_path_that_repeats_a_node() {
     tokio::spawn(radii_fetch::relay::run(r_listener, runtime));
     wait_ready(&r_addr).await.unwrap();
 
-    let mut hop =
-        radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
-            .await
-            .unwrap();
+    let mut hop = radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
+        .await
+        .unwrap();
 
     write_message(
         &mut hop,
@@ -163,10 +164,9 @@ async fn rejects_a_path_longer_than_the_local_limit() {
     tokio::spawn(radii_fetch::relay::run(r_listener, runtime));
     wait_ready(&r_addr).await.unwrap();
 
-    let mut hop =
-        radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
-            .await
-            .unwrap();
+    let mut hop = radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
+        .await
+        .unwrap();
 
     write_message(
         &mut hop,
@@ -228,10 +228,9 @@ async fn handshake_timeout_closes_a_stalled_pre_splice_connection() {
     tokio::spawn(radii_fetch::relay::run(r_listener, runtime));
     wait_ready(&r_addr).await.unwrap();
 
-    let mut hop =
-        radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
-            .await
-            .unwrap();
+    let mut hop = radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
+        .await
+        .unwrap();
 
     write_message(
         &mut hop,
