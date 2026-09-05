@@ -1,5 +1,6 @@
 pub mod config;
 pub mod graph;
+pub mod relay;
 pub mod server;
 
 use radii_proto::tls::TlsIdentity;
