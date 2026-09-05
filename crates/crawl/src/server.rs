@@ -411,11 +411,16 @@ async fn handle_connection(
                 tracing::info!(source = %addr, "crawl ack");
             }
             RadiiMessage::TunnelOpen { .. } => {
-                tracing::info!(source = %addr, "crawl tunnel open (not yet implemented)");
+                // Crawl is the graph-registry service, not a relay hop. TunnelOpen frames
+                // belong to the dedicated relay listener in crates/fetch (relay.rs/chain.rs).
+                tracing::warn!(
+                    source = %addr,
+                    "crawl refused to relay an unsupported message"
+                );
                 write_message(
                     &mut stream,
                     &RadiiMessage::Ack {
-                        status: "not_yet_implemented".to_string(),
+                        status: "unsupported_message".to_string(),
                     },
                 )
                 .await?;
