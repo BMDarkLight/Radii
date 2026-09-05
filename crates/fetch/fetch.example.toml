@@ -3,14 +3,16 @@ upstream = "127.0.0.1:22"
 
 # Optional: resolve the upstream from Crawl's live reachability graph instead
 # of the static `upstream` above, which becomes the fallback used when no
-# reachable route to target_node_id exists yet.
+# reachable route to any of target_node_ids exists yet.
 [graph]
 crawl_upstream = "127.0.0.1:7100"
 source_node_id = "fetch"
-target_node_id = "node-b"
+target_node_ids = ["node-b"]
 poll_interval_ms = 5000
 allowed_protocols = ["ssh"]
 max_hops = 4
+max_candidates = 3
+attempt_timeout_ms = 3000
 
 # Optional: require mutual TLS for the graph poller's connection to Crawl
 # above. Absent, that connection stays plaintext. See docs/tls.md.
@@ -29,4 +31,24 @@ max_hops = 4
 # [tunnel_tls.upstream]
 # cert = "/etc/radii/fetch-tunnel.cert.pem"
 # key = "/etc/radii/fetch-tunnel.key.pem"
+# ca = "/etc/radii/ca.cert.pem"
+
+# Optional: accept relayed tunnel chains. Absent, this node neither forwards
+# chains for others nor terminates one addressed to it. Mutual TLS is
+# mandatory here — a relay listener without it is an open proxy.
+#
+# A node that should only ever be a chain *target* sets max_hops = 1: it will
+# accept a frame naming just itself and refuse anything longer.
+# [relay]
+# bind = "0.0.0.0:2224"
+# node_id = "node-b"
+# max_hops = 8
+# max_concurrent_total = 256
+# max_concurrent_per_peer = 8
+# idle_timeout_ms = 30000
+# allow_peers = []              # empty = any peer with a CA-valid certificate
+#
+# [relay.tls]
+# cert = "/etc/radii/relay.cert.pem"
+# key = "/etc/radii/relay.key.pem"
 # ca = "/etc/radii/ca.cert.pem"

@@ -36,7 +36,16 @@ pub async fn run_poll(
 ) -> anyhow::Result<()> {
     let interval = Duration::from_millis(config.poll_interval_ms.max(1));
     let source = NodeId(config.source_node_id.clone());
-    let dest = NodeId(config.target_node_id.clone());
+    // `target_node_ids` may now name several candidates (config plumbing for
+    // a later task); until multi-target planning lands, resolve against the
+    // first one, preserving today's single-target behaviour exactly.
+    let dest = NodeId(
+        config
+            .target_node_ids
+            .first()
+            .cloned()
+            .expect("load() rejects an empty target_node_ids"),
+    );
     let allowed_protocols: Vec<ProtocolId> = config
         .allowed_protocols
         .iter()

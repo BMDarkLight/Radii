@@ -1,10 +1,11 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
-use radii_fetch::config::GraphConfig;
 use radii_fetch::graph::{self, SharedTarget};
 use radii_fetch::server::run_on_dynamic;
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::{read_message, write_message, RadiiMessage};
+use std::io::Write;
 use std::sync::{Arc, RwLock};
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -69,14 +70,20 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
     read_message(&mut stream).await.unwrap();
 
     let target: SharedTarget = Arc::new(RwLock::new(None));
-    let graph_config = GraphConfig {
-        crawl_upstream: crawl_addr.clone(),
-        source_node_id: "fetch".into(),
-        target_node_id: "node-b".into(),
-        poll_interval_ms: 20,
-        allowed_protocols: vec!["ssh".into()],
-        max_hops: 4,
-    };
+    let mut config_file = NamedTempFile::new().unwrap();
+    writeln!(config_file, "bind = \"0.0.0.0:0\"").unwrap();
+    writeln!(config_file, "upstream = \"127.0.0.1:1\"").unwrap();
+    writeln!(config_file, "[graph]").unwrap();
+    writeln!(config_file, "crawl_upstream = \"{crawl_addr}\"").unwrap();
+    writeln!(config_file, "source_node_id = \"fetch\"").unwrap();
+    writeln!(config_file, "target_node_id = \"node-b\"").unwrap();
+    writeln!(config_file, "poll_interval_ms = 20").unwrap();
+    writeln!(config_file, "allowed_protocols = [\"ssh\"]").unwrap();
+    writeln!(config_file, "max_hops = 4").unwrap();
+    let graph_config = radii_fetch::config::load(config_file.path())
+        .unwrap()
+        .graph
+        .expect("graph config present");
     let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&target), None));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
