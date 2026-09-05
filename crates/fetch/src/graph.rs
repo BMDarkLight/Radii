@@ -7,10 +7,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// The currently resolved upstream address, refreshed by [`run_poll`].
-/// `None` means no reachable route has been found yet; callers fall back to
-/// their static configured upstream in that case.
-pub type SharedTarget = Arc<RwLock<Option<String>>>;
+/// An upstream Fetch learned from Crawl's graph: the address to dial, plus
+/// the node id that address is *claimed* to belong to.
+///
+/// The two travel together on purpose. The address comes from a peer-written
+/// node registry, so it is a claim rather than a fact; keeping the node id
+/// beside it lets the tunnel verify, at handshake time, that the host which
+/// answered is the node the route was planned to. Without that, a poisoned
+/// `listen_addrs` silently redirects the tunnel to an attacker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    pub addr: String,
+    pub node_id: String,
+}
+
+/// The currently resolved upstream, refreshed by [`run_poll`]. `None` means
+/// no reachable route has been found yet; callers fall back to their static
+/// configured upstream in that case.
+pub type SharedTarget = Arc<RwLock<Option<ResolvedTarget>>>;
 
 /// Polls Crawl for its reachability graph on a fixed interval, plans a route
 /// from `source_node_id` to `target_node_id`, and keeps `target` pointed at
@@ -45,7 +59,10 @@ pub async fn run_poll(
         {
             Ok(Some((addr, hops, score))) => {
                 tracing::debug!(target = %dest.0, backend = %addr, hops, score, "fetch resolved graph target");
-                *target.write().expect("fetch graph target poisoned") = Some(addr);
+                *target.write().expect("fetch graph target poisoned") = Some(ResolvedTarget {
+                    addr,
+                    node_id: dest.0.clone(),
+                });
             }
             Ok(None) => {
                 tracing::warn!(target = %dest.0, "fetch found no reachable route to graph target");

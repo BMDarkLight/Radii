@@ -160,14 +160,54 @@ pub async fn accept(
 
 /// Dials `addr`, upgrading to mTLS when `identity` is configured.
 pub async fn dial(addr: &str, identity: Option<&TlsIdentity>) -> Result<BoxedStream> {
+    dial_expecting(addr, identity, None).await
+}
+
+/// Dials `addr` like [`dial`], but additionally requires the peer that
+/// answers to be the node named by `expected_node_id`.
+///
+/// A valid CA-issued certificate only proves the peer belongs to the mesh; it
+/// does not prove it is the peer you meant to reach. That distinction matters
+/// wherever the address itself came from untrusted data — Crawl's node
+/// registry is written by peers, so an address learned from the graph is a
+/// claim, not a fact. Checking the Subject CN against the node id turns the
+/// handshake into an assertion about *which* node answered.
+///
+/// The check applies only when TLS is actually in use: on a plaintext
+/// connection there is no certificate to check, and callers get today's
+/// unauthenticated behavior (see `SECURITY.md` — plaintext listeners are
+/// documented as untrusted-network-unsafe).
+pub async fn dial_expecting(
+    addr: &str,
+    identity: Option<&TlsIdentity>,
+    expected_node_id: Option<&str>,
+) -> Result<BoxedStream> {
     let stream = TcpStream::connect(addr).await?;
     match identity {
         Some(identity) => {
             let server_name = server_name_for_addr(addr)?;
             let tls_stream = identity.connector().connect(server_name, stream).await?;
+            if let Some(expected) = expected_node_id {
+                let actual = server_identity(&tls_stream)?;
+                if actual != expected {
+                    bail!(
+                        "upstream {addr} authenticated as node {actual:?}, expected {expected:?}"
+                    );
+                }
+            }
             Ok(Box::new(tls_stream))
         }
-        None => Ok(Box::new(stream)),
+        None => {
+            if let Some(expected) = expected_node_id {
+                tracing::warn!(
+                    %addr,
+                    expected_node_id = %expected,
+                    "dialing a graph-resolved address without TLS: cannot verify the \
+                     peer is the intended node"
+                );
+            }
+            Ok(Box::new(stream))
+        }
     }
 }
 
@@ -180,6 +220,20 @@ fn client_identity(stream: &TlsServerStream) -> Result<String> {
     let leaf = certs
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty client certificate chain"))?;
+    peer_common_name(leaf)
+}
+
+/// The authenticated node identity of the *server* on an outbound TLS
+/// connection, taken from its leaf certificate's Subject CN.
+fn server_identity(stream: &TlsClientStream) -> Result<String> {
+    let certs = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .ok_or_else(|| anyhow::anyhow!("no server certificate presented"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("empty server certificate chain"))?;
     peer_common_name(leaf)
 }
 

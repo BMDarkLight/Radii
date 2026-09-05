@@ -89,7 +89,12 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
     })
     .await
     .expect("timed out waiting for fetch to learn the graph target");
-    assert_eq!(target.read().unwrap().as_deref(), Some(echo_addr.as_str()));
+    {
+        let guard = target.read().unwrap();
+        let resolved = guard.as_ref().expect("graph target resolved");
+        assert_eq!(resolved.addr, echo_addr);
+        assert_eq!(resolved.node_id, "node-b");
+    }
 
     let (fetch_listener, fetch_addr) = bind_local().await.unwrap();
     let fetch_handle = tokio::spawn(async move {

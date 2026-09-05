@@ -1174,6 +1174,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "x509-parser",
 ]
 
