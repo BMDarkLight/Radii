@@ -50,7 +50,7 @@ pub struct GraphConfig {
     /// Maps an inbound HTTP host to the Crawl node ids that may serve it.
     /// A bare string is accepted for the single-node form, so configs
     /// written before multiple targets existed keep loading.
-    #[serde(default)]
+    #[serde(default, rename = "node_map")]
     node_map_raw: HashMap<String, OneOrMany>,
     /// Normalised form of `node_map_raw`, populated by [`load`].
     #[serde(skip)]
@@ -143,6 +143,47 @@ default_backend = "http://127.0.0.1:9000"
         assert_eq!(
             config.routing.host_map.get("example.com").unwrap(),
             "http://10.0.0.10:9000"
+        );
+    }
+
+    /// `node_map_raw` is renamed to the TOML key `node_map` so `[graph.node_map]`
+    /// is actually read. Without `#[serde(rename = "node_map")]` this field
+    /// silently stays empty, `GraphRoutePolicy` matches no host, and every
+    /// request falls through to `host_map`/default — exactly the shape of
+    /// `head.example.toml`. This test goes through `load()`, not
+    /// `GraphRoutePolicy::new` directly, so it actually exercises the
+    /// serde/normalisation path that broke.
+    #[test]
+    fn loads_graph_node_map_from_config() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[http]
+bind = "127.0.0.1:8080"
+
+[routing]
+default_backend = "http://127.0.0.1:9000"
+
+[graph]
+crawl_upstream = "127.0.0.1:7100"
+
+[graph.node_map]
+"example.com" = ["node-b", "node-c"]
+"single.example.com" = "node-b"
+"#
+        )
+        .unwrap();
+
+        let config = load(file.path()).unwrap();
+        let graph = config.graph.expect("graph present");
+        assert_eq!(
+            graph.node_map.get("example.com").unwrap(),
+            &vec!["node-b".to_string(), "node-c".to_string()]
+        );
+        assert_eq!(
+            graph.node_map.get("single.example.com").unwrap(),
+            &vec!["node-b".to_string()]
         );
     }
 }
