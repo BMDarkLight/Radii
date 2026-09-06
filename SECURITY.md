@@ -124,8 +124,8 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Relay authorization | `radii-crawl` (`relay_peers`), `radii-head` | `FromHead` envelopes are accepted only from node ids the operator lists in `relay_peers` (default: none), and the inner claim must match the identity Head authenticated for its own bridge client — so a Head cannot launder a spoofed node id, and a peer that is not a configured Head cannot relay at all |
 | Non-recursive relay envelope | `radii-proto` (`RelayedMessage`) | `FromHead` carries a flat message type rather than a boxed `RadiiMessage`, so a nested envelope cannot drive the deserializer into a stack overflow (which aborted the process, not just the connection) |
 | Relay admission | `radii-fetch` (`[relay]`) | Relaying is opt-in per node — absent `[relay]`, a node neither forwards chains nor terminates one, and no second listener is opened. Mutual TLS is mandatory: config load **fails** if `[relay]` is present without `[relay.tls]`, because a relay listener without client-certificate verification is an open proxy. Admission is CA membership, narrowed to an explicit list when `allow_peers` is set. **`allow_peers` narrows who may hand this node a chain — the inbound mTLS peer on this hop — not who may originate one.** At chain length one those are the same identity; beyond one hop the inbound peer is the previous relay, and a chain's actual originator is authenticated instead by the end-to-end session (see the End-to-end tunnel identity row) |
-| Relay resource bounds | `radii-fetch` (`[relay]`) | Per-peer and global concurrency caps keyed by the authenticated node id, a bound on the whole pre-splice handshake (`handshake_timeout_ms`), and an inactivity deadline on a carried chain (`idle_timeout_ms`). The per-peer cap is the load-bearing one: with admission open to any CA-valid peer, a global cap alone lets one identity take every slot. A slot is released on `Drop`, so it returns however the chain ends. One peer can cost at most `max_concurrent_per_peer × max_hops` connections |
-| Source-route validation | `radii-fetch` (`relay::validate`) | A relay refuses a path not addressed to it (`tunnel_misaddressed`), longer than its own `max_hops` (`tunnel_too_long`), or containing a repeated node id (`tunnel_path_loops`) — so routing cycles are impossible rather than merely bounded. Checks run before any dialing, and before the peer is charged a slot |
+| Relay resource bounds | `radii-fetch` (`[relay]`) | Per-peer and global concurrency caps keyed by the authenticated node id, a bound on the whole pre-splice handshake (`handshake_timeout_ms`), and an inactivity deadline on a carried chain (`idle_timeout_ms`). The per-peer cap is the load-bearing one: with admission open to any CA-valid peer, a global cap alone lets one identity take every slot. A slot is released on `Drop`, so it returns however the chain ends. **The caps bound only *admitted* connections — `acquire()` runs after the mTLS accept and the first frame (`TunnelOpen`) read, not before.** So an admitted peer costs at most `max_concurrent_per_peer` connections against this relay (and `max_concurrent_total` across all peers), but nothing bounds how many connections a peer can hold open *before* admission other than `handshake_timeout_ms` each — see the pre-admission gap below |
+| Source-route validation | `radii-fetch` (`relay::validate`) | A relay refuses a path not addressed to it (`tunnel_misaddressed`), longer than its own `max_hops` (`tunnel_too_long`), or containing a repeated node id (`tunnel_path_loops`) — so routing cycles are impossible rather than merely bounded. Checks run before any dialing, but **after** the peer is already charged a slot (`acquire()` runs first in `relay::handshake`) |
 | Relayed status sanitisation | `radii-fetch` (`relay::KNOWN_ACK_STATUSES`) | A downstream hop's reply is relayed upstream, so only an `Ack` is ever forwarded and only with a status from a closed vocabulary; anything else becomes one fixed local code. Without this a compromised hop could push up to `MAX_FRAME_LEN` of arbitrary text — newlines, escapes — through every upstream node's logs |
 | End-to-end tunnel identity | `radii-fetch` (`chain::establish`) | Two nested TLS sessions authenticate different peers: the hop-local one authenticates the first relay dialed, the end-to-end one authenticates the final target. **This holds only when `[tunnel_tls]` identities are actually configured on the originating and terminal nodes.** Without them, `tls::connect_on`/`accept_on` fall back to plaintext and a relay carrying the chain sees cleartext, not ciphertext — Fetch warns at startup when `[graph]` is configured without `[tunnel_tls.upstream]` (`config::graph_without_e2e_tls_warning`) |
 | Upstream node verification | `radii-fetch`, `radii-proto` (`tls::dial_expecting`) | When Fetch dials a graph-resolved upstream over mTLS, the peer's certificate CN must match the node id the route was planned to — a poisoned `listen_addrs` cannot silently redirect the tunnel to another CA-issued host |
@@ -139,6 +139,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | A configured relay peer is still trusted to report its clients' identities honestly | Crawl checks that a `FromHead` claim matches the `client_identity` the Head asserts, but that assertion is the Head's word. A *compromised* Head (one whose private key an attacker holds) can still relay any claim it likes for a client it invents. Relay rights are therefore a trust grant: list only Heads you operate |
 | No authorization on Head HTTP | Information disclosure of backend maps via decision JSON |
 | No connection timeouts *outside the relay path* | Crawl's listener and Head's bridge still have no deadline on TLS handshakes, idle sessions, or upstream dials — connections that never make progress hold a task and a socket indefinitely. The relay path and Fetch's candidate dials are now bounded (`handshake_timeout_ms`, `idle_timeout_ms`, `attempt_timeout_ms`); the rest are not |
+| Relay concurrency caps do not cover pre-admission connections | `relay::acquire` runs only after the inbound mTLS accept and the first frame read succeed — see the Relay resource bounds row. A peer can open as many concurrent connections as it likes before admission, each held open for up to `handshake_timeout_ms` at zero accounting cost, uncapped by `max_concurrent_per_peer` or `max_concurrent_total`. This is a real, unmitigated resource-exhaustion surface, distinct from the (mitigated) post-admission concurrency the caps do cover |
 | A relay certificate is a bandwidth grant | With admission by CA membership, issuing a certificate entitles the holder to forwarding capacity, not only to writing graph reports. Narrow with `allow_peers` where that is not intended, and see [`docs/tls.md`](docs/tls.md) on what revocation is protecting |
 | Relays observe traffic patterns | Payloads are opaque to a relay, but it sees volume, timing, and its immediate neighbours. There is no padding and no cover traffic — **this is not anonymity** and must not be described as such |
 | A relay can deny service to a chain it carries | It can stall or drop. It cannot read or impersonate the endpoint. Ranked-candidate retry is the mitigation, not prevention |
@@ -184,15 +185,27 @@ Two consequences, and both are operator-visible:
       still advertising a plain tunnel port will complete the hop-local
       handshake and then have `TunnelOpen` framing bytes spliced straight into
       its upstream backend, after which every candidate fails and traffic
-      degrades silently to the static `upstream`.
+      degrades silently to the static `upstream`. **Fetch has no startup
+      warning for this — a `[graph]`-configured node with `[relay]` present
+      but a wrong `listen_addrs` value looks fully configured and only fails
+      on the wire.** The only related warning fires when `[relay]` is missing
+      *entirely* (`config::graph_without_relay_warning`), which does not
+      catch a `[relay]` section that is present but advertised under the
+      wrong address.
 - [ ] **A node that terminates chains must configure `[tunnel_tls.listener]`.**
       The end-to-end session is the only thing authenticating an originator
       once chains exceed one hop — at length one the originator is the peer the
       outer session already authenticated, but beyond that it is not the
       previous hop. Without a listener identity the node cannot complete the
       inner handshake at all, and the operator sees an opaque TLS error rather
-      than a configuration problem. Fetch emits a startup warning for both of
-      these conditions.
+      than a configuration problem. Fetch emits a startup warning for *this*
+      condition (`config::relay_without_tunnel_listener_tls_warning`) — see
+      above for the one that has none.
+- [ ] **A node that originates chains (has `[graph]`) should configure
+      `[tunnel_tls.upstream]`.** Without it the end-to-end layer falls back to
+      plaintext, readable by every relay the chain passes through. Fetch
+      warns at startup for this condition
+      (`config::graph_without_e2e_tls_warning`).
 
 ### Peer authentication (mTLS)
 
