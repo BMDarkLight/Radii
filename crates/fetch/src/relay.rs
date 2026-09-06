@@ -340,22 +340,21 @@ async fn terminate(
     mut inbound: BoxedStream,
     runtime: Arc<RelayRuntime>,
 ) -> Result<Option<(BoxedStream, BoxedStream)>> {
-    let upstream = match tokio::net::TcpStream::connect(crate::server::normalize_upstream(
-        &runtime.upstream,
-    ))
-    .await
-    {
-        Ok(stream) => stream,
-        Err(err) => {
-            tracing::warn!(
-                upstream = %runtime.upstream,
-                error = %err,
-                "relay terminal could not reach its own upstream"
-            );
-            refuse(&mut inbound, "tunnel_hop_unreachable").await?;
-            return Ok(None);
-        }
-    };
+    let upstream =
+        match tokio::net::TcpStream::connect(crate::server::normalize_upstream(&runtime.upstream))
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(
+                    upstream = %runtime.upstream,
+                    error = %err,
+                    "relay terminal could not reach its own upstream"
+                );
+                refuse(&mut inbound, "tunnel_hop_unreachable").await?;
+                return Ok(None);
+            }
+        };
 
     write_message(
         &mut inbound,
