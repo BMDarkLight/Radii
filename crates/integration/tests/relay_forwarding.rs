@@ -110,6 +110,58 @@ async fn a_two_hop_chain_carries_bytes_end_to_end() {
     assert_eq!(&buf, b"through");
 }
 
+/// A two-hop chain whose second hop is unreachable: the intermediate relay
+/// must refuse with `tunnel_hop_unreachable` rather than any other status,
+/// since that is the exact signal `chain::establish`'s caller depends on to
+/// retry the next candidate instead of treating this as a generic failure.
+#[tokio::test]
+async fn a_two_hop_chain_reports_an_unreachable_second_hop() {
+    let ca = TestCa::new();
+    let client_identity = TlsIdentity::load(&ca.issue("node-s")).unwrap();
+
+    // Intermediate relay: up and reachable.
+    let (r_listener, r_addr) = bind_local().await.unwrap();
+    let r_runtime = radii_fetch::relay::RelayRuntime::new(
+        relay_config(&ca, "node-r", &r_addr),
+        "127.0.0.1:1".to_string(), // never used: this node only forwards
+        None,
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(r_listener, r_runtime));
+    wait_ready(&r_addr).await.unwrap();
+
+    // The second hop's address: nothing is listening here.
+    let (t_listener, t_addr) = bind_local().await.unwrap();
+    drop(t_listener);
+
+    let mut hop = radii_proto::tls::dial_expecting(&r_addr, Some(&client_identity), Some("node-r"))
+        .await
+        .unwrap();
+
+    write_message(
+        &mut hop,
+        &RadiiMessage::TunnelOpen {
+            hops: vec![
+                RouteHop {
+                    node_id: "node-r".into(),
+                    addr: r_addr.clone(),
+                },
+                RouteHop {
+                    node_id: "node-t".into(),
+                    addr: t_addr.clone(),
+                },
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    match read_message(&mut hop).await.unwrap() {
+        RadiiMessage::Ack { status } => assert_eq!(status, "tunnel_hop_unreachable"),
+        other => panic!("expected tunnel_hop_unreachable, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rejects_a_path_that_repeats_a_node() {
     let ca = TestCa::new();

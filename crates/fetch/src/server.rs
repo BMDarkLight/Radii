@@ -136,8 +136,21 @@ async fn connect_upstream(
     attempt_timeout_ms: u64,
     upstream_tls: Option<&TlsIdentity>,
 ) -> anyhow::Result<BoxedStream> {
-    let candidates: Vec<ResolvedRoute> =
-        routes.read().map(|guard| guard.clone()).unwrap_or_default();
+    // A poisoned lock (the graph poller panicked while holding the write
+    // side, see `graph.rs`) silently degrades every connection to the
+    // static-upstream fallback below — a permanent, hard-to-notice failure
+    // mode unless it is logged here rather than swallowed by
+    // `unwrap_or_default`.
+    let candidates: Vec<ResolvedRoute> = match routes.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            tracing::warn!(
+                "fetch routes lock is poisoned; falling back to the static upstream for this \
+                 connection"
+            );
+            Vec::new()
+        }
+    };
 
     let bound = Duration::from_millis(attempt_timeout_ms.max(1));
     for (index, route) in candidates.iter().enumerate() {
