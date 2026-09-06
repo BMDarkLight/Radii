@@ -299,8 +299,21 @@ async fn refuse(stream: &mut BoxedStream, status: &str) -> Result<()> {
     Ok(())
 }
 
-/// This node is the chain's last hop: ack, then run the end-to-end session
-/// and splice it to the configured upstream.
+/// This node is the chain's last hop: dial its own upstream FIRST, then ack,
+/// then run the end-to-end session and splice it to that upstream.
+///
+/// The upstream dial has to happen before the ack. `chain::establish` treats
+/// an `Ack{tunnel_ready}` as proof the chain is usable and stops retrying
+/// other candidates the moment it sees one — so acking before this node has
+/// actually reached its own backend would let a terminal with a dead backend
+/// consume the candidate and never be failed over, which is exactly the
+/// common case (a backend outage) source routing exists to route around. On
+/// a failed dial this refuses with `tunnel_hop_unreachable` instead of
+/// acking, so the originator retries the next candidate.
+///
+/// The ack still comes before the inner TLS accept: the originator waits for
+/// it before starting that handshake, so acking any later would deadlock
+/// against a peer that is correctly waiting on us.
 ///
 /// At chain length one the originator IS the authenticated TCP peer, so the
 /// outer mTLS on the relay listener covers it. Now that chains can be longer
@@ -315,6 +328,23 @@ async fn terminate(
     mut inbound: BoxedStream,
     runtime: Arc<RelayRuntime>,
 ) -> Result<Option<(BoxedStream, BoxedStream)>> {
+    let upstream = match tokio::net::TcpStream::connect(crate::server::normalize_upstream(
+        &runtime.upstream,
+    ))
+    .await
+    {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(
+                upstream = %runtime.upstream,
+                error = %err,
+                "relay terminal could not reach its own upstream"
+            );
+            refuse(&mut inbound, "tunnel_hop_unreachable").await?;
+            return Ok(None);
+        }
+    };
+
     write_message(
         &mut inbound,
         &RadiiMessage::Ack {
@@ -331,9 +361,6 @@ async fn terminate(
         "relay terminating a chain"
     );
 
-    let upstream =
-        tokio::net::TcpStream::connect(crate::server::normalize_upstream(&runtime.upstream))
-            .await?;
     Ok(Some((e2e, Box::new(upstream))))
 }
 

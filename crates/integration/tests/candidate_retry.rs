@@ -101,6 +101,89 @@ async fn falls_over_to_the_second_candidate_when_the_first_is_dead() {
     );
 }
 
+/// The failure mode `terminate()`'s dial-before-ack ordering exists to
+/// close: a first candidate that is a REAL, reachable relay terminal — the
+/// hop-local handshake succeeds and the node is very much up — but whose own
+/// configured upstream is a dead address. Before the fix, this relay would
+/// ack `tunnel_ready` before ever dialing its upstream, so `chain::establish`
+/// would return Ok and the retry loop would stop, never reaching the second,
+/// working candidate. The client must still get its data.
+#[tokio::test]
+async fn falls_over_when_the_first_candidates_own_upstream_is_dead() {
+    let ca = TestCa::new();
+    let client_identity = TlsIdentity::load(&ca.issue("node-s")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    // First candidate: a real, reachable relay terminal whose own upstream
+    // is a dead address. The hop-local handshake with this node succeeds —
+    // it is genuinely up — but it can never reach its backend.
+    let (t1_listener, t1_addr) = bind_local().await.unwrap();
+    tokio::spawn(radii_fetch::relay::run(
+        t1_listener,
+        radii_fetch::relay::RelayRuntime::new(
+            relay_config(&ca, "node-t1", &t1_addr),
+            "127.0.0.1:1".to_string(), // dead: this node's own upstream is down
+            Some(TlsIdentity::load(&ca.issue("node-t1")).unwrap()),
+        )
+        .unwrap(),
+    ));
+    wait_ready(&t1_addr).await.unwrap();
+
+    // Second candidate: a real, reachable relay terminal with a working
+    // upstream.
+    let (t2_listener, t2_addr) = bind_local().await.unwrap();
+    tokio::spawn(radii_fetch::relay::run(
+        t2_listener,
+        radii_fetch::relay::RelayRuntime::new(
+            relay_config(&ca, "node-t2", &t2_addr),
+            echo_addr.to_string(),
+            Some(TlsIdentity::load(&ca.issue("node-t2")).unwrap()),
+        )
+        .unwrap(),
+    ));
+    wait_ready(&t2_addr).await.unwrap();
+
+    let routes = vec![
+        ResolvedRoute {
+            hops: vec![ResolvedHop {
+                node_id: NodeId("node-t1".into()),
+                addr: t1_addr.to_string(),
+            }],
+            score: 1.0,
+        },
+        ResolvedRoute {
+            hops: vec![ResolvedHop {
+                node_id: NodeId("node-t2".into()),
+                addr: t2_addr.to_string(),
+            }],
+            score: 2.0,
+        },
+    ];
+
+    let (fetch_listener, fetch_addr) = bind_local().await.unwrap();
+    let shared = Arc::new(RwLock::new(routes));
+    tokio::spawn(radii_fetch::server::run_on_dynamic_with_tls(
+        fetch_listener,
+        "127.0.0.1:1".to_string(),
+        shared,
+        3000,
+        None,
+        Some(client_identity),
+    ));
+    wait_ready(&fetch_addr).await.unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(&fetch_addr).await.unwrap();
+    client.write_all(b"failover").await.unwrap();
+    let mut buf = [0u8; 8];
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(
+        &buf, b"failover",
+        "a dead backend behind a live relay terminal must not consume the candidate"
+    );
+}
+
 #[tokio::test]
 async fn falls_back_to_the_static_upstream_when_every_candidate_fails() {
     let (echo_listener, echo_addr) = bind_local().await.unwrap();
