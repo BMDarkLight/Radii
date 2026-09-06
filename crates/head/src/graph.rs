@@ -99,6 +99,53 @@ pub fn plan_backend(
     Some((addr, route.hops.len() + 1, route.score))
 }
 
+/// All reachable backends for `targets`, best first.
+///
+/// NOTE ON WHAT AN ADDRESS MEANS HERE. Head returns these to a caller that
+/// will dial them as ordinary backends. Fetch reads the *same* node registry
+/// and now treats an entry as a relay listener — one that requires mutual
+/// TLS and a `TunnelOpen` preamble before it will carry anything. One
+/// registry field therefore has two incompatible readings, and Head assumes
+/// the plain-backend one. A node advertising a relay listener will be handed
+/// to Head's callers as though it were an HTTP backend, and the failure will
+/// look like a backend outage. Resolving this needs either separate address
+/// roles per node or a role tag in the registry; both are protocol changes
+/// beyond this function. See `SECURITY.md`'s residual-risk table.
+pub fn plan_backends(
+    state: &SharedGraphState,
+    source: &NodeId,
+    targets: &[NodeId],
+    allowed_protocols: &[ProtocolId],
+    max_hops: usize,
+    limit: usize,
+) -> Vec<(String, usize, f64)> {
+    let Ok(guard) = state.read() else {
+        return Vec::new();
+    };
+    radii_core::routing::resolve_candidates(
+        &guard.snapshot,
+        &guard.listen_addrs,
+        source,
+        targets,
+        allowed_protocols,
+        max_hops,
+        limit,
+    )
+    .into_iter()
+    .map(|route| {
+        let addr = route
+            .hops
+            .last()
+            .expect("ResolvedRoute::hops is non-empty by construction")
+            .addr
+            .clone();
+        // `hops` excludes the source; the reported count includes it, so the
+        // number matches what `plan_backend` has always returned.
+        (addr, route.hops.len() + 1, route.score)
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,4 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
-use radii_head::config::GraphConfig;
 use radii_head::decision::{DecisionEngine, GraphRoutePolicy};
 use radii_head::graph::{self, GraphState};
 use radii_head::http::serve_http_on;
@@ -55,14 +54,25 @@ async fn head_resolves_backend_from_crawl_graph() {
 
     // Head's graph poller pulls that snapshot on an interval.
     let graph_state: graph::SharedGraphState = Arc::new(RwLock::new(GraphState::default()));
-    let graph_config = GraphConfig {
-        crawl_upstream: crawl_addr.clone(),
-        source_node_id: "head".into(),
-        poll_interval_ms: 20,
-        allowed_protocols: vec!["http".into()],
-        max_hops: 4,
-        node_map: HashMap::new(),
-    };
+    // `GraphConfig` carries a private normalisation field, so it is built
+    // through `load()` rather than by struct literal — the same path an
+    // operator's config takes.
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    writeln!(config_file, "[http]").unwrap();
+    writeln!(config_file, "bind = \"127.0.0.1:0\"").unwrap();
+    writeln!(config_file, "[routing]").unwrap();
+    writeln!(config_file, "default_backend = \"http://127.0.0.1:9000\"").unwrap();
+    writeln!(config_file, "[graph]").unwrap();
+    writeln!(config_file, "crawl_upstream = \"{crawl_addr}\"").unwrap();
+    writeln!(config_file, "source_node_id = \"head\"").unwrap();
+    writeln!(config_file, "poll_interval_ms = 20").unwrap();
+    writeln!(config_file, "allowed_protocols = [\"http\"]").unwrap();
+    writeln!(config_file, "max_hops = 4").unwrap();
+    let graph_config = radii_head::config::load(config_file.path())
+        .unwrap()
+        .graph
+        .expect("graph section present");
     let poll_handle = tokio::spawn(graph::run_poll(
         graph_config,
         Arc::clone(&graph_state),
@@ -81,12 +91,13 @@ async fn head_resolves_backend_from_crawl_graph() {
     .expect("timed out waiting for head to learn the graph");
 
     let mut node_map = HashMap::new();
-    node_map.insert("example.com".to_string(), "node-b".to_string());
+    node_map.insert("example.com".to_string(), vec!["node-b".to_string()]);
     let graph_policy = GraphRoutePolicy::new(
         node_map,
         "head".to_string(),
         vec!["http".to_string()],
         4,
+        3,
         graph_state,
     );
 

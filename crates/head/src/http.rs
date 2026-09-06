@@ -18,6 +18,10 @@ struct HeadResponse {
     source_ip: String,
     host: Option<String>,
     backend: String,
+    /// Every reachable backend, best first, `backend` being the first.
+    /// Head does not proxy, so it cannot fail over itself — the list is
+    /// here so its caller can.
+    candidates: Vec<String>,
     decision_reason: String,
 }
 
@@ -88,6 +92,7 @@ async fn handle_request(
         source_ip: connect.0.to_string(),
         host: host_value,
         backend: decision.backend,
+        candidates: decision.candidates,
         decision_reason: reason.to_string(),
     }))
 }

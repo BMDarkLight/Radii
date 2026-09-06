@@ -21,9 +21,15 @@ source_node_id = "head"
 poll_interval_ms = 5000
 allowed_protocols = ["http"]
 max_hops = 4
+# How many ranked backends to report per host. Head does not proxy, so it
+# cannot fail over itself — the extras are reported so its caller can.
+max_candidates = 3
 
+# A host may name several nodes. Head plans to all of them and reports the
+# reachable ones best-first. A bare string still works for a single node.
 [graph.node_map]
-"example.com" = "node-b"
+"example.com" = ["node-b", "node-c"]
+"single.example.com" = "node-b"
 
 # Optional: require mutual TLS for the Radii bridge listener above and for
 # every outbound connection Head makes to Crawl (the bridge relay and the

@@ -23,6 +23,14 @@ pub struct DecisionInput<'a> {
 #[derive(Clone)]
 pub struct BackendDecision {
     pub backend: String,
+    /// Every reachable backend for this host, best first, of which
+    /// `backend` is the first. Empty for policies that resolve a single
+    /// answer by construction (the static host map, the default).
+    ///
+    /// Head does not proxy, so it cannot fail over itself; exposing the
+    /// ranked list is what lets whatever consumes the decision do so, and
+    /// it is the seam a future reverse proxy will read.
+    pub candidates: Vec<String>,
     pub reason: DecisionReason,
 }
 
@@ -84,6 +92,7 @@ impl DecisionEngine {
 
         BackendDecision {
             backend: "unreachable".to_string(),
+            candidates: Vec::new(),
             reason: DecisionReason::Default,
         }
     }
@@ -100,29 +109,32 @@ impl Default for DecisionEngine {
 /// Falls through (returns `None`) when the host isn't mapped or no reachable
 /// route currently exists, leaving the static host map / default as fallback.
 pub struct GraphRoutePolicy {
-    node_map: HashMap<String, NodeId>,
+    node_map: HashMap<String, Vec<NodeId>>,
     source: NodeId,
     allowed_protocols: Vec<ProtocolId>,
     max_hops: usize,
+    max_candidates: usize,
     state: SharedGraphState,
 }
 
 impl GraphRoutePolicy {
     pub fn new(
-        node_map: HashMap<String, String>,
+        node_map: HashMap<String, Vec<String>>,
         source_node_id: String,
         allowed_protocols: Vec<String>,
         max_hops: usize,
+        max_candidates: usize,
         state: SharedGraphState,
     ) -> Self {
         Self {
             node_map: node_map
                 .into_iter()
-                .map(|(host, node_id)| (host, NodeId(node_id)))
+                .map(|(host, node_ids)| (host, node_ids.into_iter().map(NodeId).collect()))
                 .collect(),
             source: NodeId(source_node_id),
             allowed_protocols: allowed_protocols.into_iter().map(ProtocolId::new).collect(),
             max_hops,
+            max_candidates,
             state,
         }
     }
@@ -131,17 +143,28 @@ impl GraphRoutePolicy {
 impl DecisionPolicy for GraphRoutePolicy {
     fn evaluate(&self, input: &DecisionInput<'_>) -> Option<BackendDecision> {
         let host = input.host?;
-        let target = self.node_map.get(host)?;
-        let (backend, hops, score) = graph::plan_backend(
+        let targets = self.node_map.get(host)?;
+        let resolved = graph::plan_backends(
             &self.state,
             &self.source,
-            target,
+            targets,
             &self.allowed_protocols,
             self.max_hops,
-        )?;
-        tracing::debug!(host, backend = %backend, hops, score, "graph route matched");
+            self.max_candidates,
+        );
+        let candidates: Vec<String> = resolved.iter().map(|(addr, _, _)| addr.clone()).collect();
+        let (backend, hops, score) = resolved.into_iter().next()?;
+        tracing::debug!(
+            host,
+            backend = %backend,
+            hops,
+            score,
+            candidates = candidates.len(),
+            "graph route matched"
+        );
         Some(BackendDecision {
             backend,
+            candidates,
             reason: DecisionReason::GraphRoute,
         })
     }
@@ -163,6 +186,7 @@ impl DecisionPolicy for HostMapPolicy {
         let backend = self.host_map.get(host)?;
         Some(BackendDecision {
             backend: backend.clone(),
+            candidates: Vec::new(),
             reason: DecisionReason::HostMatch,
         })
     }
@@ -182,6 +206,7 @@ impl DecisionPolicy for DefaultPolicy {
     fn evaluate(&self, _input: &DecisionInput<'_>) -> Option<BackendDecision> {
         Some(BackendDecision {
             backend: self.backend.clone(),
+            candidates: Vec::new(),
             reason: DecisionReason::Default,
         })
     }
@@ -253,12 +278,13 @@ mod tests {
     fn graph_route_takes_priority_over_host_map() {
         let state = graph_state_with_reachable_route();
         let mut node_map = HashMap::new();
-        node_map.insert("example.com".to_string(), "node-b".to_string());
+        node_map.insert("example.com".to_string(), vec!["node-b".to_string()]);
         let graph_policy = GraphRoutePolicy::new(
             node_map,
             "head".to_string(),
             vec!["http".to_string()],
             4,
+            3,
             state,
         );
 
@@ -281,7 +307,7 @@ mod tests {
     fn graph_route_falls_through_when_host_unmapped() {
         let state = graph_state_with_reachable_route();
         let graph_policy =
-            GraphRoutePolicy::new(HashMap::new(), "head".to_string(), vec![], 4, state);
+            GraphRoutePolicy::new(HashMap::new(), "head".to_string(), vec![], 4, 3, state);
 
         let mut host_map = HashMap::new();
         host_map.insert("example.com".into(), "http://10.0.0.10:9000".into());

@@ -21,6 +21,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
             graph_config.source_node_id.clone(),
             graph_config.allowed_protocols.clone(),
             graph_config.max_hops,
+            graph_config.max_candidates,
             Arc::clone(&graph_state),
         )
     });
