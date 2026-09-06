@@ -153,12 +153,26 @@ async fn connect_upstream(
         )
         .await;
 
+        // The first hop's address is what was actually dialed, and is the
+        // single highest-value field for diagnosing a misconfigured
+        // registry: since Task 10 every route target must run a relay
+        // listener, and an operator whose registry still advertises a plain
+        // tunnel port needs to see which address failed, not just which
+        // node id. `hops` is documented non-empty, but `.first()` guards
+        // the index rather than trusting that.
+        let addr = route
+            .hops
+            .first()
+            .map(|hop| hop.addr.as_str())
+            .unwrap_or("<no-hops>");
+
         match attempt {
             Ok(Ok(stream)) => {
                 tracing::info!(
                     candidate = index,
                     target = %route.target().0,
                     hops = route.hops.len(),
+                    %addr,
                     "fetch established a chain"
                 );
                 return Ok(stream);
@@ -166,12 +180,14 @@ async fn connect_upstream(
             Ok(Err(err)) => tracing::warn!(
                 candidate = index,
                 target = %route.target().0,
+                %addr,
                 error = %err,
                 "candidate failed; trying the next"
             ),
             Err(_) => tracing::warn!(
                 candidate = index,
                 target = %route.target().0,
+                %addr,
                 timeout_ms = attempt_timeout_ms,
                 "candidate timed out; trying the next"
             ),
@@ -186,7 +202,24 @@ async fn connect_upstream(
         upstream = %static_upstream,
         "every candidate failed; falling back to the static upstream"
     );
-    radii_proto::tls::dial(&normalize_upstream(static_upstream), upstream_tls).await
+    // `attempt_timeout_ms` exists to bound connect latency for a candidate
+    // attempt; this fallback dial is the last leg of that same connection
+    // and must not be able to escape it. Without this timeout, a
+    // black-holed static upstream would hang the connection indefinitely —
+    // and today, before the relay listener is wired into `run()`, every
+    // graph-resolved candidate fails on every connection, so every
+    // connection reaches this fallback.
+    match tokio::time::timeout(
+        bound,
+        radii_proto::tls::dial(&normalize_upstream(static_upstream), upstream_tls),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "static upstream fallback to {static_upstream} timed out after {attempt_timeout_ms}ms"
+        ),
+    }
 }
 
 async fn handle_connection(inbound: BoxedStream, outbound: BoxedStream) -> anyhow::Result<()> {

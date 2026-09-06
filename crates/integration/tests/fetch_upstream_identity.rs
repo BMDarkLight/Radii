@@ -56,6 +56,19 @@ async fn run_plain_echo(listener: TcpListener) {
 }
 
 fn relay_config(ca: &TestCa, node_id: &str, bind: &str) -> radii_fetch::config::RelayConfig {
+    relay_config_with_identity(ca, node_id, node_id, bind)
+}
+
+/// Like [`relay_config`], but lets the certificate identity diverge from the
+/// relay's own `node_id` — the shape a poisoned registry entry takes: a
+/// node that claims to be `node_id` in the route (and so passes `validate`'s
+/// `hops[0] == self` check) while actually authenticating as `cert_name`.
+fn relay_config_with_identity(
+    ca: &TestCa,
+    node_id: &str,
+    cert_name: &str,
+    bind: &str,
+) -> radii_fetch::config::RelayConfig {
     radii_fetch::config::RelayConfig {
         bind: bind.to_string(),
         node_id: node_id.to_string(),
@@ -65,7 +78,7 @@ fn relay_config(ca: &TestCa, node_id: &str, bind: &str) -> radii_fetch::config::
         idle_timeout_ms: 30_000,
         handshake_timeout_ms: 10_000,
         allow_peers: Vec::new(),
-        tls: Some(ca.issue(node_id)),
+        tls: Some(ca.issue(cert_name)),
     }
 }
 
@@ -104,20 +117,55 @@ async fn tunnel_through(
 /// answering there authenticates as a different node. Fetch must refuse
 /// rather than relay bytes to it — even though that host holds a perfectly
 /// valid certificate from the same CA.
+///
+/// Since Task 10 the data path always goes through `chain::establish`, which
+/// speaks the relay protocol rather than dialing a bare TLS socket. A plain
+/// TLS echo standing in for the attacker would make this test pass for the
+/// wrong reason: `establish` writes `TunnelOpen`, the echo reflects those
+/// bytes back verbatim, and `read_message` bails with a decode/protocol
+/// error having never reached the identity check at all — deleting the CN
+/// check entirely would leave this test green. So the attacker fixture here
+/// is a real relay terminal node — `RelayConfig.node_id = "node-b"`, so
+/// `validate`'s `hops[0] == self` check passes and it would happily ack —
+/// but whose TLS identity is a certificate issued to `attacker`. The only
+/// thing that can still stop the chain is the hop-local CN check in
+/// `dial_expecting`, which is exactly the property this test exists to
+/// prove.
 #[tokio::test]
 async fn refuses_an_upstream_that_is_not_the_intended_node() {
     let ca = TestCa::new();
-    let attacker_identity = TlsIdentity::load(&ca.issue("attacker")).unwrap();
     let fetch_identity = TlsIdentity::load(&ca.issue("fetch")).unwrap();
 
-    let (echo_listener, echo_addr) = bind_local().await.unwrap();
-    let echo_handle = tokio::spawn(run_tls_echo(echo_listener, attacker_identity));
+    // A real, working upstream behind the attacker relay's terminate() step
+    // — not a dead address — so that if every identity check were bypassed
+    // the hijack would genuinely succeed (bytes echoed back) rather than
+    // failing anyway for the unrelated reason of a dead fallback address.
+    let (plain_echo_listener, plain_echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_plain_echo(plain_echo_listener));
+
+    let (attacker_listener, attacker_addr) = bind_local().await.unwrap();
+    tokio::spawn(radii_fetch::relay::run(
+        attacker_listener,
+        radii_fetch::relay::RelayRuntime::new(
+            // Claims to be "node-b" (so it passes the relay's own hop
+            // validation) but authenticates with an "attacker" certificate
+            // on both the hop-local listener and the nested end-to-end
+            // session, so a bypass of either layer's identity check is
+            // still caught by the other rather than by an incidental
+            // transport error.
+            relay_config_with_identity(&ca, "node-b", "attacker", &attacker_addr),
+            plain_echo_addr,
+            Some(TlsIdentity::load(&ca.issue("attacker")).unwrap()),
+        )
+        .unwrap(),
+    ));
+    wait_ready(&attacker_addr).await.unwrap();
 
     let bytes = tunnel_through(
         Some(ResolvedRoute {
             hops: vec![ResolvedHop {
                 node_id: NodeId("node-b".into()),
-                addr: echo_addr,
+                addr: attacker_addr,
             }],
             score: 1.0,
         }),
@@ -131,7 +179,6 @@ async fn refuses_an_upstream_that_is_not_the_intended_node() {
         matches!(bytes, Ok(0)) || bytes.is_err(),
         "fetch must not relay bytes to a host that is not the intended node"
     );
-    echo_handle.abort();
 }
 
 /// Pins *why* the tunnel above refuses: the handshake itself succeeds — the
