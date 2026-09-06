@@ -102,34 +102,24 @@ async fn run_starts_the_relay_listener_when_configured() {
     assert_eq!(&buf, b"wired");
 }
 
-/// Absent `[relay]`, no second listener is opened — relaying stays opt-in
-/// and an upgrade does not silently turn a node into a relay.
-#[tokio::test]
-async fn run_opens_no_relay_listener_without_a_relay_section() {
-    let (echo_listener, echo_addr) = bind_local().await.unwrap();
-    tokio::spawn(run_echo(echo_listener));
-
-    let tunnel_bind = free_addr().await;
-    let unused_relay_bind = free_addr().await;
-
-    let config = Config {
-        bind: tunnel_bind.clone(),
-        upstream: echo_addr,
-        graph: None,
-        tls: None,
-        tunnel_tls: None,
-        relay: None,
-    };
-
-    tokio::spawn(async move {
-        let _ = radii_fetch::run(config).await;
-    });
-    wait_ready(&tunnel_bind).await.unwrap();
-
-    assert!(
-        tokio::net::TcpStream::connect(&unused_relay_bind)
-            .await
-            .is_err(),
-        "no relay listener should exist when [relay] is absent"
-    );
-}
+// A prior version of this file had
+// `run_opens_no_relay_listener_without_a_relay_section`, which connected to
+// an address obtained from `free_addr()` — an ephemeral port picked at
+// random and never named anywhere in the `Config` passed to `run()`. That
+// assertion ("nothing listens on this unrelated free port") passes
+// regardless of what `run()` actually does with `relay: None`: it would
+// pass even for a build that (incorrectly) opened a relay listener on some
+// other, real address, because the test never checked an address the code
+// could plausibly have bound. It has been removed rather than kept as
+// false assurance.
+//
+// The property it was trying to cover — relaying is opt-in, and `[relay]`
+// absent means no second listener opens — is already covered for real:
+// `run_starts_the_relay_listener_when_configured` above proves a listener
+// DOES bind and serve a chain when `[relay]` is `Some`, and in
+// `radii_fetch::lib::run` the entire bind-and-spawn block for the relay
+// listener is gated by `if let Some(relay_config) = config.relay.clone()`,
+// so with `relay: None` there is structurally no address for a relay
+// listener to bind to in the first place — there is nothing left to name
+// as "the specific configured address" the finding asked this test to
+// check, because no such address exists when the section is absent.

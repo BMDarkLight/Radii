@@ -171,6 +171,104 @@ async fn caps_concurrent_chains_per_peer() {
     );
 }
 
+/// `caps_concurrent_chains_per_peer` above uses one identity twice, which
+/// proves nothing about *which* dimension is capped — a tally keyed by a
+/// constant, or by source IP, or by anything else that happens to be the
+/// same for both calls in that test, would pass it too. This test uses two
+/// DISTINCT identities: peer A holds a chain against
+/// `max_concurrent_per_peer = 1`, and peer B — genuinely different, not just
+/// a different connection — must still be admitted, proving the tally is
+/// keyed by the authenticated peer.
+#[tokio::test]
+async fn per_peer_cap_is_keyed_by_authenticated_identity_not_shared_globally() {
+    let ca = TestCa::new();
+    let peer_a = TlsIdentity::load(&ca.issue("node-a")).unwrap();
+    let peer_b = TlsIdentity::load(&ca.issue("node-b")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.max_concurrent_per_peer = 1;
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        config,
+        echo_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-t")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+
+    let route = route_to(&relay_addr);
+
+    // Peer A holds its one permitted slot open.
+    let mut held = radii_fetch::chain::establish(&route, Some(&peer_a), Some(&peer_a))
+        .await
+        .expect("peer A's first chain should be admitted");
+    held.write_all(b"hold").await.unwrap();
+    let mut buf = [0u8; 4];
+    held.read_exact(&mut buf).await.unwrap();
+
+    // Peer B is a genuinely different authenticated identity and must be
+    // admitted even though peer A is already at its per-peer cap — if the
+    // tally were keyed by anything other than the authenticated peer (a
+    // constant, the shared source IP, the relay itself), this would
+    // incorrectly refuse peer B too.
+    let mut other = radii_fetch::chain::establish(&route, Some(&peer_b), Some(&peer_b))
+        .await
+        .expect("a distinct peer must be admitted despite peer A being at its own cap");
+    other.write_all(b"also").await.unwrap();
+    let mut buf2 = [0u8; 4];
+    other.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, b"also");
+}
+
+/// `max_concurrent_total` was never set low enough to actually trip in the
+/// existing suite. This sets it to 1 with two distinct peers, so the second
+/// admitted peer is refused purely by the global cap even though neither has
+/// touched its own per-peer limit.
+#[tokio::test]
+async fn max_concurrent_total_refuses_a_second_peer_once_tripped() {
+    let ca = TestCa::new();
+    let peer_a = TlsIdentity::load(&ca.issue("node-a")).unwrap();
+    let peer_b = TlsIdentity::load(&ca.issue("node-b")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.max_concurrent_total = 1;
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        config,
+        echo_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-t")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+
+    let route = route_to(&relay_addr);
+
+    let mut held = radii_fetch::chain::establish(&route, Some(&peer_a), Some(&peer_a))
+        .await
+        .expect("first chain should be admitted under the global cap");
+    held.write_all(b"hold").await.unwrap();
+    let mut buf = [0u8; 4];
+    held.read_exact(&mut buf).await.unwrap();
+
+    let second = radii_fetch::chain::establish(&route, Some(&peer_b), Some(&peer_b)).await;
+    let err = match second {
+        Ok(_) => panic!("second peer should have been refused by the global cap"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("relay_busy"),
+        "expected relay_busy, got: {err}"
+    );
+}
+
 /// A slot must come back when its chain ends, or the cap degrades into a
 /// permanent lockout after `max_concurrent_per_peer` connections.
 #[tokio::test]
