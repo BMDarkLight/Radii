@@ -25,3 +25,43 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
 - Authenticated control-plane surface
 - Live config reload
 - HTTPS / SSH / DNS surfaces (deferred until the HTTP path is solid)
+
+## Ranked backend candidates
+
+A host in `[graph.node_map]` may name several nodes:
+
+```toml
+[graph.node_map]
+"example.com" = ["node-b", "node-c"]
+"single.example.com" = "node-b"     # the bare-string form still works
+```
+
+Head plans to all of them, ranks the reachable ones by the same cost function
+the route planner uses, and reports up to `max_candidates` of them in the
+decision JSON:
+
+```json
+{
+  "backend": "10.0.0.12:9000",
+  "candidates": ["10.0.0.12:9000", "10.0.0.11:9000"],
+  "decision_reason": "graph_route"
+}
+```
+
+`backend` is the first candidate, so existing consumers are unaffected.
+
+**Head does not proxy**, so it cannot fail over itself — it returns a decision
+and the caller dials it. The `candidates` list is what lets that caller fail
+over, and it is the seam a future reverse proxy will read.
+
+### One caveat worth knowing
+
+Head and Fetch read the *same* node registry but disagree about what an
+address means. Fetch treats a node's advertised address as a relay listener —
+one that requires mutual TLS and a `TunnelOpen` preamble. Head assumes the
+plain-backend reading and hands the address to its caller to dial directly. A
+node advertising a relay listener will therefore be given to Head's callers as
+though it were an HTTP backend, and the failure will look like a backend
+outage. Resolving this needs separate address roles per node, or a role tag in
+the registry; both are protocol changes. See the residual-risk table in
+[`SECURITY.md`](../../SECURITY.md).

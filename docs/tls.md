@@ -60,6 +60,36 @@ The Subject CN of a peer's leaf certificate is its **authenticated node identity
 
 **Known limitation:** this check only applies to direct connections. Messages relayed through Head's bridge (`RadiiMessage::FromHead`) are trusted at the connection level — Crawl verifies that *Head* is an authenticated peer, but does not independently re-verify the identity of whichever client originally sent the wrapped message to Head. Head is a trust boundary in the current design; do not run an untrusted Head in front of a Crawl instance you don't want poisoned.
 
+## What a certificate grants on the relay path
+
+Before source routing, a Radii certificate proved mesh membership and
+authorized a peer to write its own graph reports. The relay listener widens
+that considerably, and it is worth stating plainly:
+
+- **A certificate is now also a bandwidth grant.** `[relay]` admits any peer
+  holding a certificate from the configured CA — that openness is what makes
+  donated public nodes possible. Issuing a certificate therefore entitles the
+  holder to forwarding capacity and connection slots on every relay that
+  trusts your CA. Where that is not intended, narrow admission with
+  `allow_peers`; the bounds (`max_concurrent_per_peer`, `max_concurrent_total`,
+  `handshake_timeout_ms`, `idle_timeout_ms`) are what keep an admitted peer
+  from taking more than its share.
+- **Revocation is protecting more than it used to.** A leaked key previously
+  meant forged reports; it now also means forwarding capacity, and traffic
+  patterns visible to the holder. Weigh that when setting certificate
+  lifetimes.
+- **A node needs two certificates whose CNs agree.** `[relay.tls]` is used for
+  the hop-local session with a neighbour; `[tunnel_tls.listener]` is used for
+  the end-to-end session with an originator. Both are checked against the same
+  node id — the hop-local check by the previous hop, the end-to-end check by
+  the originator — so a node whose two certificates carry *different* Subject
+  CNs will fail one of them. Issue both to the same node id.
+- **A chain terminal without `[tunnel_tls.listener]` cannot serve.** The
+  end-to-end session is the only proof of an originator's identity once chains
+  exceed one hop, and without a listener identity the inner handshake cannot
+  complete at all. Fetch warns at startup; the failure otherwise surfaces as an
+  opaque TLS error.
+
 ## Rotation
 
 There is no automated rotation yet. To rotate a node's certificate:

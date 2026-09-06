@@ -25,3 +25,45 @@ cargo run -p radii-fetch -- --config crates/fetch/fetch.example.toml
 
 - Failover / retry across candidates within a single connection
 - Move beyond single-upstream tunnels (multiplexed / multi-target delivery)
+
+## Relaying (`[relay]`)
+
+A Fetch node carries other peers' traffic only when `[relay]` is present.
+Absent it, no second listener is opened and the node neither forwards a chain
+nor terminates one — an upgrade never silently turns a node into a relay.
+
+The relay listener is separate from the tunnel listener on purpose: the tunnel
+listener carries raw bytes with no framing, so a `TunnelOpen` preamble cannot
+be read there without breaking every existing plain client. Keeping them apart
+also lets you firewall relay capability independently, which matters when its
+whole point is exposure to peers you do not run.
+
+`[relay.tls]` is mandatory — config load fails without it, because a relay
+listener that does not verify client certificates is an open proxy.
+
+### Two hop limits, and which applies where
+
+- `[graph] max_hops` bounds how long a route this node will *plan* for itself.
+- `[relay] max_hops` bounds how long a path this node will *carry* for someone
+  else, and is enforced regardless of what an originator asks for. A node that
+  should only ever be a chain's endpoint sets `max_hops = 1`: it will accept a
+  frame naming just itself and refuse anything longer.
+
+Both sit under `radii_core::routing::MAX_ROUTE_HOPS` (32), which no config can
+raise.
+
+### The retry boundary
+
+A candidate route is retryable only until the end-to-end handshake with the
+target completes. After that, application bytes may have flowed, and TCP
+offers no way to migrate a stream — so a later failure is terminal and reaches
+the client as a closed connection rather than being retried onto another
+candidate. This is deliberate, not an omission: making it otherwise would mean
+buffering client traffic in the hope of replaying it.
+
+### Deployment requirement
+
+Any node that can appear in a resolved route — **including as a route's
+target** — must run `[relay]` and advertise *that listener's* address in its
+`listen_addrs`. See the source-routing section of [`SECURITY.md`](../../SECURITY.md)
+for why, and for what breaks if it advertises a plain tunnel port instead.

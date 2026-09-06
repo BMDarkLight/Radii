@@ -113,10 +113,10 @@ printf '%s\n' \
 ## What works today
 
 - **Crawl:** accepts `NodeHello`, probes, and reports over the Radii TCP protocol; keeps an in-memory view; acknowledges messages.
-- **Head:** HTTP `/health`; other paths return a JSON backend decision — resolved from Crawl's live reachability graph when configured, falling back to a host map, then a default; optional Radii listener that forwards to Crawl.
-- **Fetch:** TCP tunnel from `bind` to an upstream — resolved live from Crawl's reachability graph when configured, otherwise a static `upstream` (`ssh://` / `tcp://` prefixes stripped).
+- **Head:** HTTP `/health`; other paths return a JSON backend decision — resolved from Crawl's live reachability graph when configured, falling back to a host map, then a default; a host may map to several nodes, and the response carries every reachable backend best-first in `candidates` so a caller can fail over. Optional Radii listener that forwards to Crawl.
+- **Fetch:** TCP tunnel from `bind` to an upstream, reached either directly or over a source-routed chain of relays. Routes come from Crawl's reachability graph as a ranked candidate list spanning several paths *and* several target nodes; a failed candidate falls over to the next, and an exhausted list falls back to the static `upstream` (`ssh://` / `tcp://` prefixes stripped). Relays carry end-to-end-encrypted bytes they cannot read. Relaying is opt-in per node (`[relay]`), requires mutual TLS, and is bounded by per-peer and global concurrency caps, a handshake deadline, and an idle deadline.
 - **core/cli:** graph snapshot + route planner; CLI hello/report/plan.
-- **Security:** opt-in mutual TLS (peer authentication + transport encryption + route authorization) for the Radii protocol and Fetch's tunnel data path — see [`docs/tls.md`](docs/tls.md).
+- **Security:** opt-in mutual TLS (peer authentication + transport encryption + route authorization) for the Radii protocol and Fetch's tunnel data path; mandatory mutual TLS on the relay listener, with admission by CA membership (narrowable via `allow_peers`) and enforced resource bounds — see [`docs/tls.md`](docs/tls.md) and [`SECURITY.md`](SECURITY.md).
 
 ## Configuration
 
