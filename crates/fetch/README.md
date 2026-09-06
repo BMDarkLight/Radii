@@ -41,6 +41,17 @@ whole point is exposure to peers you do not run.
 `[relay.tls]` is mandatory — config load fails without it, because a relay
 listener that does not verify client certificates is an open proxy.
 
+### `allow_peers` narrows the previous hop, not the originator
+
+Admission (`allow_peers`) checks the inbound mTLS peer on *this* hop. At
+chain length one that peer is the chain's originator, so `allow_peers` really
+does restrict who may start a chain here. Beyond one hop it is not: the
+inbound peer is the upstream relay that forwarded the request, not whoever
+originated it. An operator who sets `allow_peers` on a terminal node expecting
+it to restrict who may reach that node's upstream gets no such restriction for
+traffic arriving via any admitted relay. A multi-hop chain's originator is
+authenticated separately, by the end-to-end session — not by this check.
+
 ### Two hop limits, and which applies where
 
 - `[graph] max_hops` bounds how long a route this node will *plan* for itself.

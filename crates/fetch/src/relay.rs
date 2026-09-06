@@ -116,6 +116,18 @@ impl RelayRuntime {
     /// signed — narrowed to an explicit list when the operator sets one.
     /// An empty `allow_peers` is the open, donated-node posture, not a
     /// closed door.
+    ///
+    /// `peer` is always the inbound mTLS peer on THIS hop — the previous
+    /// node in the chain, not necessarily the chain's originator. At chain
+    /// length one those are the same identity, so `allow_peers` really does
+    /// restrict who may originate a chain here. Beyond one hop they are not:
+    /// `peer` is the upstream relay that forwarded the request, and
+    /// `allow_peers` narrows who may *hand this node a chain*, not who may
+    /// *originate* one — an operator wanting to restrict origination on a
+    /// multi-hop terminal gets no such restriction from this check. The
+    /// chain's actual originator is authenticated separately, by the
+    /// end-to-end session established in `terminate`/accepted via
+    /// `tunnel_listener_tls`, not by this admission check.
     fn admits(&self, peer: &str) -> bool {
         self.config.allow_peers.is_empty() || self.config.allow_peers.iter().any(|id| id == peer)
     }
