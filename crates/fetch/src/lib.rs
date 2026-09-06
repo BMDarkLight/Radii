@@ -28,6 +28,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
 
     match config.graph {
         Some(graph_config) => {
+            let attempt_timeout_ms = graph_config.attempt_timeout_ms;
             let routes: graph::SharedRoutes = Arc::new(RwLock::new(Vec::new()));
             tokio::spawn(graph::run_poll(
                 graph_config,
@@ -38,6 +39,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
                 listener,
                 config.upstream,
                 routes,
+                attempt_timeout_ms,
                 listener_tls,
                 upstream_tls,
             )

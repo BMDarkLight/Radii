@@ -1,6 +1,8 @@
 use crate::graph::SharedRoutes;
+use radii_core::routing::ResolvedRoute;
 use radii_proto::tls::TlsIdentity;
 use radii_proto::BoxedStream;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 
 pub async fn run(bind: &str, upstream: &str) -> anyhow::Result<()> {
@@ -21,7 +23,7 @@ pub async fn run_on_dynamic(
     static_upstream: String,
     routes: SharedRoutes,
 ) -> anyhow::Result<()> {
-    run_on_dynamic_with_tls(listener, static_upstream, routes, None, None).await
+    run_on_dynamic_with_tls(listener, static_upstream, routes, 3000, None, None).await
 }
 
 /// Like [`run_on`], additionally requiring mTLS on the inbound side
@@ -40,7 +42,7 @@ pub async fn run_on_with_tls(
         let upstream_tls = upstream_tls.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                accept_and_tunnel(stream, addr, upstream, None, listener_tls, upstream_tls).await
+                accept_and_tunnel(stream, addr, upstream, listener_tls, upstream_tls).await
             {
                 tracing::warn!(source = %addr, error = %err, "fetch tunnel failed");
             }
@@ -53,32 +55,23 @@ pub async fn run_on_dynamic_with_tls(
     listener: TcpListener,
     static_upstream: String,
     routes: SharedRoutes,
+    attempt_timeout_ms: u64,
     listener_tls: Option<TlsIdentity>,
     upstream_tls: Option<TlsIdentity>,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
-        // A graph-resolved upstream carries the node id it is supposed to
-        // belong to, so the dial can verify it. The static fallback carries
-        // none: that address came from the operator's own config, which is
-        // trusted by definition and may legitimately point at a host with no
-        // Radii node identity at all (an SSH daemon, say).
-        let resolved = routes.read().ok().and_then(|guard| guard.first().cloned());
-        let (upstream, expected_node_id) = match resolved {
-            Some(route) => {
-                let last = route.hops.last().expect("non-empty hops").clone();
-                (last.addr, Some(last.node_id.0))
-            }
-            None => (static_upstream.clone(), None),
-        };
+        let static_upstream = static_upstream.clone();
+        let routes = routes.clone();
         let listener_tls = listener_tls.clone();
         let upstream_tls = upstream_tls.clone();
         tokio::spawn(async move {
-            if let Err(err) = accept_and_tunnel(
+            if let Err(err) = accept_and_tunnel_dynamic(
                 stream,
                 addr,
-                upstream,
-                expected_node_id,
+                static_upstream,
+                routes,
+                attempt_timeout_ms,
                 listener_tls,
                 upstream_tls,
             )
@@ -94,7 +87,6 @@ async fn accept_and_tunnel(
     inbound: TcpStream,
     source: std::net::SocketAddr,
     upstream: String,
-    expected_node_id: Option<String>,
     listener_tls: Option<TlsIdentity>,
     upstream_tls: Option<TlsIdentity>,
 ) -> anyhow::Result<()> {
@@ -102,15 +94,99 @@ async fn accept_and_tunnel(
         radii_proto::tls::accept(inbound, listener_tls.as_ref()).await?;
 
     let target = normalize_upstream(&upstream);
-    tracing::info!(source = %source, upstream = %target, expected_node_id = ?expected_node_id, "fetch tunneling");
-    let outbound = radii_proto::tls::dial_expecting(
-        &target,
-        upstream_tls.as_ref(),
-        expected_node_id.as_deref(),
-    )
-    .await?;
+    tracing::info!(source = %source, upstream = %target, "fetch tunneling");
+    let outbound = radii_proto::tls::dial(&target, upstream_tls.as_ref()).await?;
 
     handle_connection(inbound, outbound).await
+}
+
+async fn accept_and_tunnel_dynamic(
+    inbound: TcpStream,
+    source: std::net::SocketAddr,
+    static_upstream: String,
+    routes: SharedRoutes,
+    attempt_timeout_ms: u64,
+    listener_tls: Option<TlsIdentity>,
+    upstream_tls: Option<TlsIdentity>,
+) -> anyhow::Result<()> {
+    let (inbound, _peer_identity) =
+        radii_proto::tls::accept(inbound, listener_tls.as_ref()).await?;
+
+    let outbound = connect_upstream(
+        &routes,
+        &static_upstream,
+        attempt_timeout_ms,
+        upstream_tls.as_ref(),
+    )
+    .await?;
+    tracing::info!(source = %source, "fetch tunneling");
+
+    handle_connection(inbound, outbound).await
+}
+
+/// Walks the ranked candidates until one chain comes up, then splices.
+///
+/// Retry stops the moment the end-to-end handshake succeeds: after that,
+/// application bytes may have flowed and TCP offers no way to migrate the
+/// stream, so a later failure is terminal by construction rather than by
+/// choice. See the design spec's "Retry boundary".
+async fn connect_upstream(
+    routes: &SharedRoutes,
+    static_upstream: &str,
+    attempt_timeout_ms: u64,
+    upstream_tls: Option<&TlsIdentity>,
+) -> anyhow::Result<BoxedStream> {
+    let candidates: Vec<ResolvedRoute> =
+        routes.read().map(|guard| guard.clone()).unwrap_or_default();
+
+    let bound = Duration::from_millis(attempt_timeout_ms.max(1));
+    for (index, route) in candidates.iter().enumerate() {
+        // The whole `establish` call — every await inside it, including the
+        // TCP dial, the hop-local TLS handshake, the TunnelOpen write, its
+        // ack, and the nested end-to-end handshake — is unbounded on its
+        // own, so the timeout has to wrap the entire call. Anything awaited
+        // outside this `timeout` would leave a hole a stalled relay could
+        // hang the connection on.
+        let attempt = tokio::time::timeout(
+            bound,
+            crate::chain::establish(route, upstream_tls, upstream_tls),
+        )
+        .await;
+
+        match attempt {
+            Ok(Ok(stream)) => {
+                tracing::info!(
+                    candidate = index,
+                    target = %route.target().0,
+                    hops = route.hops.len(),
+                    "fetch established a chain"
+                );
+                return Ok(stream);
+            }
+            Ok(Err(err)) => tracing::warn!(
+                candidate = index,
+                target = %route.target().0,
+                error = %err,
+                "candidate failed; trying the next"
+            ),
+            Err(_) => tracing::warn!(
+                candidate = index,
+                target = %route.target().0,
+                timeout_ms = attempt_timeout_ms,
+                "candidate timed out; trying the next"
+            ),
+        }
+    }
+
+    // No candidate worked. The static upstream came from the operator's own
+    // config, which is trusted by definition and may legitimately point at a
+    // host with no Radii identity at all, so it carries no expected node id.
+    tracing::warn!(
+        candidates = candidates.len(),
+        upstream = %static_upstream,
+        "every candidate failed; falling back to the static upstream"
+    );
+    radii_proto::tls::dial(&normalize_upstream(static_upstream), upstream_tls).await
 }
 
 async fn handle_connection(inbound: BoxedStream, outbound: BoxedStream) -> anyhow::Result<()> {

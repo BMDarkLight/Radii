@@ -37,6 +37,38 @@ async fn run_tls_echo(listener: TcpListener, identity: TlsIdentity) {
     }
 }
 
+/// A plain (non-TLS) byte echo, standing in for whatever service a relay's
+/// terminal node forwards to once it has terminated the end-to-end session.
+async fn run_plain_echo(listener: TcpListener) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn relay_config(ca: &TestCa, node_id: &str, bind: &str) -> radii_fetch::config::RelayConfig {
+    radii_fetch::config::RelayConfig {
+        bind: bind.to_string(),
+        node_id: node_id.to_string(),
+        max_hops: 8,
+        max_concurrent_total: 16,
+        max_concurrent_per_peer: 4,
+        idle_timeout_ms: 30_000,
+        handshake_timeout_ms: 10_000,
+        allow_peers: Vec::new(),
+        tls: Some(ca.issue(node_id)),
+    }
+}
+
 async fn tunnel_through(
     route: Option<ResolvedRoute>,
     listener_tls: Option<TlsIdentity>,
@@ -50,6 +82,7 @@ async fn tunnel_through(
             fetch_listener,
             static_upstream,
             shared,
+            3000,
             listener_tls,
             upstream_tls,
         )
@@ -139,20 +172,39 @@ async fn dial_expecting_rejects_a_valid_cert_for_the_wrong_node() {
 
 /// The honest path still works: the host answering at the advertised address
 /// authenticates as the node the route was planned to.
+///
+/// Since Task 10, a resolved route is walked via `chain::establish`, which
+/// speaks the relay protocol (`TunnelOpen`/`Ack` plus a nested end-to-end
+/// handshake) even for a single-hop route — the target of any graph-resolved
+/// route is now assumed to run a relay listener, terminate-only or not. So
+/// the honest node in this test must actually be a terminal relay node
+/// rather than a bare TLS echo; the identity check under test still runs at
+/// the very first step of `establish` (the hop-local dial), unchanged.
 #[tokio::test]
 async fn tunnels_to_an_upstream_that_proves_its_node_id() {
     let ca = TestCa::new();
-    let node_b_identity = TlsIdentity::load(&ca.issue("node-b")).unwrap();
     let fetch_identity = TlsIdentity::load(&ca.issue("fetch")).unwrap();
 
-    let (echo_listener, echo_addr) = bind_local().await.unwrap();
-    let echo_handle = tokio::spawn(run_tls_echo(echo_listener, node_b_identity));
+    let (plain_echo_listener, plain_echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_plain_echo(plain_echo_listener));
+
+    let (b_listener, b_addr) = bind_local().await.unwrap();
+    tokio::spawn(radii_fetch::relay::run(
+        b_listener,
+        radii_fetch::relay::RelayRuntime::new(
+            relay_config(&ca, "node-b", &b_addr),
+            plain_echo_addr,
+            Some(TlsIdentity::load(&ca.issue("node-b")).unwrap()),
+        )
+        .unwrap(),
+    ));
+    wait_ready(&b_addr).await.unwrap();
 
     let bytes = tunnel_through(
         Some(ResolvedRoute {
             hops: vec![ResolvedHop {
                 node_id: NodeId("node-b".into()),
-                addr: echo_addr,
+                addr: b_addr,
             }],
             score: 1.0,
         }),
@@ -164,5 +216,4 @@ async fn tunnels_to_an_upstream_that_proves_its_node_id() {
     .expect("tunnel to the correct node should succeed");
 
     assert_eq!(bytes, 4, "expected the echoed \"ping\" back");
-    echo_handle.abort();
 }
