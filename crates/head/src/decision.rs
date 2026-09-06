@@ -23,9 +23,11 @@ pub struct DecisionInput<'a> {
 #[derive(Clone)]
 pub struct BackendDecision {
     pub backend: String,
-    /// Every reachable backend for this host, best first, of which
-    /// `backend` is the first. Empty for policies that resolve a single
-    /// answer by construction (the static host map, the default).
+    /// Every reachable backend for this host, best first. `backend` is
+    /// always `candidates[0]` — the static host map and the default policy
+    /// resolve a single answer by construction, so they report a
+    /// single-element list rather than leaving this empty, keeping the
+    /// invariant true on every path.
     ///
     /// Head does not proxy, so it cannot fail over itself; exposing the
     /// ranked list is what lets whatever consumes the decision do so, and
@@ -186,7 +188,7 @@ impl DecisionPolicy for HostMapPolicy {
         let backend = self.host_map.get(host)?;
         Some(BackendDecision {
             backend: backend.clone(),
-            candidates: Vec::new(),
+            candidates: vec![backend.clone()],
             reason: DecisionReason::HostMatch,
         })
     }
@@ -206,7 +208,7 @@ impl DecisionPolicy for DefaultPolicy {
     fn evaluate(&self, _input: &DecisionInput<'_>) -> Option<BackendDecision> {
         Some(BackendDecision {
             backend: self.backend.clone(),
-            candidates: Vec::new(),
+            candidates: vec![self.backend.clone()],
             reason: DecisionReason::Default,
         })
     }
@@ -240,10 +242,20 @@ mod tests {
         let matched = engine.decide(input(Some("example.com")));
         assert_eq!(matched.backend, "http://10.0.0.10:9000");
         assert!(matches!(matched.reason, DecisionReason::HostMatch));
+        assert_eq!(
+            matched.candidates.first(),
+            Some(&matched.backend),
+            "candidates[0] must equal backend on a host-map hit"
+        );
 
         let fallback = engine.decide(input(Some("other.example")));
         assert_eq!(fallback.backend, "http://127.0.0.1:9000");
         assert!(matches!(fallback.reason, DecisionReason::Default));
+        assert_eq!(
+            fallback.candidates.first(),
+            Some(&fallback.backend),
+            "candidates[0] must equal backend on the default fallback"
+        );
     }
 
     #[test]
