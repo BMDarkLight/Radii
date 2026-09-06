@@ -208,3 +208,83 @@ async fn releases_a_slot_when_the_chain_ends() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// A chain that goes quiet in BOTH directions is dropped, so a peer cannot
+/// complete a handshake, occupy a concurrency slot, and then hold it forever
+/// without sending anything.
+#[tokio::test]
+async fn drops_a_chain_that_goes_idle() {
+    let ca = TestCa::new();
+    let peer = TlsIdentity::load(&ca.issue("node-s")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.idle_timeout_ms = 300;
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        config,
+        echo_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-t")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+
+    let mut stream =
+        radii_fetch::chain::establish(&route_to(&relay_addr), Some(&peer), Some(&peer))
+            .await
+            .unwrap();
+
+    // Send nothing and wait past the idle window.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let mut buf = [0u8; 1];
+    let read = stream.read(&mut buf).await;
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "an idle chain must be dropped, got {read:?}"
+    );
+}
+
+/// Traffic keeps a chain alive past the idle window. Guards against the
+/// watchdog being a total deadline rather than an inactivity timer — that
+/// mistake would kill every long-lived tunnel.
+#[tokio::test]
+async fn keeps_a_busy_chain_alive_past_the_idle_window() {
+    let ca = TestCa::new();
+    let peer = TlsIdentity::load(&ca.issue("node-s")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.idle_timeout_ms = 300;
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        config,
+        echo_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-t")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+
+    let mut stream =
+        radii_fetch::chain::establish(&route_to(&relay_addr), Some(&peer), Some(&peer))
+            .await
+            .unwrap();
+
+    // Six round trips spanning ~1.2s, four times the idle window.
+    for _ in 0..6 {
+        stream.write_all(b"tick").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream
+            .read_exact(&mut buf)
+            .await
+            .expect("a chain carrying traffic must not be dropped as idle");
+        assert_eq!(&buf, b"tick");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}

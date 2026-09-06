@@ -168,6 +168,56 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Warns when `[graph]` is configured but `[relay]` is not.
+///
+/// Graph-resolved routes are delivered over the relay protocol — even a
+/// one-hop route terminates at the target's relay listener, which then
+/// splices to that node's own upstream. A node with `[graph]` but no
+/// `[relay]` therefore cannot be reached as a route target by anyone, and
+/// its own candidates will all fail before falling back to the static
+/// `upstream`. That is a silent, permanent, per-connection failure, so it
+/// is worth one loud line at boot.
+///
+/// Returns the message rather than logging it so the condition is testable
+/// without capturing a subscriber.
+pub fn graph_without_relay_warning(config: &Config) -> Option<&'static str> {
+    if config.graph.is_some() && config.relay.is_none() {
+        return Some(
+            "[graph] is configured but [relay] is not: this node cannot be reached as a \
+             route target, and graph-resolved candidates will fail before falling back to \
+             the static upstream. Configure [relay] and advertise its bind address in this \
+             node's listen_addrs.",
+        );
+    }
+    None
+}
+
+/// Warns when `[relay]` is configured without `[tunnel_tls.listener]`.
+///
+/// A relay terminal runs a second, end-to-end TLS session with the
+/// originator inside the hop-local one. At chain length one the originator
+/// is the peer already authenticated by the outer session, but once chains
+/// are longer the originator is not the previous hop, and that inner session
+/// is the only thing proving who it is. Without a listener identity the node
+/// cannot complete the inner handshake at all — the originator's ClientHello
+/// meets a plaintext socket, and the operator sees an opaque TLS error
+/// rather than a configuration problem.
+pub fn relay_without_tunnel_listener_tls_warning(config: &Config) -> Option<&'static str> {
+    let has_listener_tls = config
+        .tunnel_tls
+        .as_ref()
+        .is_some_and(|tls| tls.listener.is_some());
+    if config.relay.is_some() && !has_listener_tls {
+        return Some(
+            "[relay] is configured but [tunnel_tls.listener] is not: this node cannot \
+             terminate a relayed chain, and an originator attempting one will fail with an \
+             opaque TLS error. The end-to-end session is also the only proof of an \
+             originator's identity once chains exceed one hop.",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +232,43 @@ mod tests {
         let config = load(file.path()).unwrap();
         assert_eq!(config.bind, "0.0.0.0:2223");
         assert_eq!(config.upstream, "ssh://127.0.0.1:22");
+    }
+
+    #[test]
+    fn warns_when_graph_is_configured_without_a_relay() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        writeln!(file, "[graph]").unwrap();
+        writeln!(file, "crawl_upstream = \"127.0.0.1:7100\"").unwrap();
+        writeln!(file, "target_node_id = \"node-b\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(graph_without_relay_warning(&config).is_some());
+    }
+
+    #[test]
+    fn does_not_warn_without_a_graph_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(graph_without_relay_warning(&config).is_none());
+    }
+
+    #[test]
+    fn warns_when_a_relay_has_no_tunnel_listener_identity() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        writeln!(file, "[relay]").unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2224\"").unwrap();
+        writeln!(file, "node_id = \"node-r\"").unwrap();
+        writeln!(file, "[relay.tls]").unwrap();
+        writeln!(file, "cert = \"/tmp/c.pem\"").unwrap();
+        writeln!(file, "key = \"/tmp/k.pem\"").unwrap();
+        writeln!(file, "ca = \"/tmp/ca.pem\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(relay_without_tunnel_listener_tls_warning(&config).is_some());
     }
 
     #[test]

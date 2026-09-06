@@ -13,7 +13,7 @@ use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage, RouteH
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
@@ -180,7 +180,8 @@ async fn handle(
             // when the chain starts consuming resources — the cap would
             // count handshakes rather than live chains and bound nothing.
             Some((a, b, permit)) => {
-                let result = splice(a, b).await;
+                let idle = Duration::from_millis(runtime.config.idle_timeout_ms.max(1));
+                let result = splice_with_idle(a, b, idle).await;
                 drop(permit);
                 result
             }
@@ -423,12 +424,69 @@ async fn forward(
     Ok(Some((inbound, outbound)))
 }
 
-pub(crate) async fn splice(a: BoxedStream, b: BoxedStream) -> Result<()> {
+/// Copies in both directions until either side closes, or until neither
+/// direction has moved a byte for `idle`.
+///
+/// "Idle" is deliberately a property of the chain, not of one direction. A
+/// legitimate tunnel is often quiet one way for a long time — a shell session
+/// waiting on the user, a stream the client is only reading — so timing each
+/// direction independently would kill working chains. Both directions share
+/// one last-activity clock and a watchdog reads it.
+///
+/// This closes, for the relay path, the connection-timeout gap `SECURITY.md`
+/// records as outstanding: without it a peer can complete a handshake, be
+/// counted against the concurrency caps, and then hold its slot forever
+/// without sending anything.
+pub(crate) async fn splice_with_idle(a: BoxedStream, b: BoxedStream, idle: Duration) -> Result<()> {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    tokio::try_join!(
-        tokio::io::copy(&mut ar, &mut bw),
-        tokio::io::copy(&mut br, &mut aw)
-    )?;
-    Ok(())
+
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let watchdog_clock = Arc::clone(&last);
+
+    // Polled rather than reset-per-byte so a busy chain does not pay for a
+    // timer reset on every read. A quarter of the window bounds the overshoot.
+    let watchdog = async move {
+        let tick = (idle / 4).max(Duration::from_millis(10));
+        loop {
+            tokio::time::sleep(tick).await;
+            let elapsed = {
+                let guard = watchdog_clock.lock().expect("relay idle clock poisoned");
+                guard.elapsed()
+            };
+            if elapsed >= idle {
+                return;
+            }
+        }
+    };
+
+    tokio::select! {
+        result = pump(&mut ar, &mut bw, &last) => result,
+        result = pump(&mut br, &mut aw, &last) => result,
+        _ = watchdog => {
+            tracing::info!(idle_ms = idle.as_millis(), "relay dropped an idle chain");
+            Ok(())
+        }
+    }
+}
+
+/// One direction of the splice, stamping the shared clock on every read so
+/// activity either way keeps the whole chain alive.
+async fn pump<R, W>(reader: &mut R, writer: &mut W, last: &Arc<Mutex<Instant>>) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        *last.lock().expect("relay idle clock poisoned") = Instant::now();
+        writer.write_all(&buf[..read]).await?;
+    }
 }
