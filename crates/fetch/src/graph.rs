@@ -1,51 +1,54 @@
 use crate::config::GraphConfig;
-use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
+use radii_core::routing::{
+    resolve_candidates, GraphSnapshot, Link, NodeId, ProtocolId, ResolvedRoute,
+};
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// An upstream Fetch learned from Crawl's graph: the address to dial, plus
-/// the node id that address is *claimed* to belong to.
-///
-/// The two travel together on purpose. The address comes from a peer-written
-/// node registry, so it is a claim rather than a fact; keeping the node id
-/// beside it lets the tunnel verify, at handshake time, that the host which
-/// answered is the node the route was planned to. Without that, a poisoned
-/// `listen_addrs` silently redirects the tunnel to an attacker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedTarget {
-    pub addr: String,
-    pub node_id: String,
+/// The currently ranked routes, refreshed by [`run_poll`]. Empty means no
+/// reachable route has been found yet; callers fall back to their static
+/// configured upstream in that case.
+pub type SharedRoutes = Arc<RwLock<Vec<ResolvedRoute>>>;
+
+/// Thin seam over `resolve_candidates` so the polling logic is unit-testable
+/// without a live Crawl.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_from(
+    snapshot: &GraphSnapshot,
+    listen_addrs: &HashMap<String, Vec<String>>,
+    source: &NodeId,
+    targets: &[NodeId],
+    allowed_protocols: &[ProtocolId],
+    max_hops: usize,
+    max_candidates: usize,
+) -> Vec<ResolvedRoute> {
+    resolve_candidates(
+        snapshot,
+        listen_addrs,
+        source,
+        targets,
+        allowed_protocols,
+        max_hops,
+        max_candidates,
+    )
 }
 
-/// The currently resolved upstream, refreshed by [`run_poll`]. `None` means
-/// no reachable route has been found yet; callers fall back to their static
-/// configured upstream in that case.
-pub type SharedTarget = Arc<RwLock<Option<ResolvedTarget>>>;
-
-/// Polls Crawl for its reachability graph on a fixed interval, plans a route
-/// from `source_node_id` to `target_node_id`, and keeps `target` pointed at
-/// the resolved address. Runs until the process shuts down; transient query
-/// or planning failures are logged and retried rather than propagated, so a
-/// Crawl outage does not take Fetch down with it.
+/// Polls Crawl for its reachability graph on a fixed interval, plans routes
+/// from `source_node_id` to every one of `target_node_ids`, and keeps
+/// `routes` pointed at the ranked, dialable results. Runs until the process
+/// shuts down; transient query or planning failures are logged and retried
+/// rather than propagated, so a Crawl outage does not take Fetch down with
+/// it.
 pub async fn run_poll(
     config: GraphConfig,
-    target: SharedTarget,
+    routes: SharedRoutes,
     tls: Option<TlsIdentity>,
 ) -> anyhow::Result<()> {
     let interval = Duration::from_millis(config.poll_interval_ms.max(1));
     let source = NodeId(config.source_node_id.clone());
-    // `target_node_ids` may now name several candidates (config plumbing for
-    // a later task); until multi-target planning lands, resolve against the
-    // first one, preserving today's single-target behaviour exactly.
-    let dest = NodeId(
-        config
-            .target_node_ids
-            .first()
-            .cloned()
-            .expect("load() rejects an empty target_node_ids"),
-    );
+    let targets: Vec<NodeId> = config.target_node_ids.iter().cloned().map(NodeId).collect();
     let allowed_protocols: Vec<ProtocolId> = config
         .allowed_protocols
         .iter()
@@ -54,42 +57,43 @@ pub async fn run_poll(
         .collect();
 
     loop {
-        match resolve_once(
-            &config.crawl_upstream,
-            &source,
-            &dest,
-            &allowed_protocols,
-            config.max_hops,
-            tls.as_ref(),
-        )
-        .await
-        {
-            Ok(Some((addr, hops, score))) => {
-                tracing::debug!(target = %dest.0, backend = %addr, hops, score, "fetch resolved graph target");
-                *target.write().expect("fetch graph target poisoned") = Some(ResolvedTarget {
-                    addr,
-                    node_id: dest.0.clone(),
-                });
-            }
-            Ok(None) => {
-                tracing::warn!(target = %dest.0, "fetch found no reachable route to graph target");
+        match fetch_once(&config.crawl_upstream, tls.as_ref()).await {
+            Ok((snapshot, listen_addrs)) => {
+                let planned = plan_from(
+                    &snapshot,
+                    &listen_addrs,
+                    &source,
+                    &targets,
+                    &allowed_protocols,
+                    config.max_hops,
+                    config.max_candidates,
+                );
+                if planned.is_empty() {
+                    tracing::warn!(?targets, "fetch found no reachable route to any target");
+                }
+                tracing::debug!(
+                    candidates = planned.len(),
+                    "fetch refreshed route candidates"
+                );
+                *routes.write().expect("fetch routes poisoned") = planned;
             }
             Err(err) => {
-                tracing::warn!(upstream = %config.crawl_upstream, error = %err, "fetch graph query failed");
+                tracing::warn!(
+                    upstream = %config.crawl_upstream,
+                    error = %err,
+                    "fetch graph query failed"
+                );
             }
         }
         tokio::time::sleep(interval).await;
     }
 }
 
-async fn resolve_once(
+/// Queries Crawl once, returning the snapshot and the node registry.
+async fn fetch_once(
     crawl_upstream: &str,
-    source: &NodeId,
-    target: &NodeId,
-    allowed_protocols: &[ProtocolId],
-    max_hops: usize,
     tls: Option<&TlsIdentity>,
-) -> anyhow::Result<Option<(String, usize, f64)>> {
+) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<String>>)> {
     let mut stream = radii_proto::tls::dial(crawl_upstream, tls).await?;
     let (nodes, reports) = radii_proto::query_graph_on(&mut stream).await?;
 
@@ -110,26 +114,48 @@ async fn resolve_once(
             "crawl graph exceeded the local size cap; planning from a partial view"
         );
     }
-    let listen_addrs: HashMap<String, Vec<String>> = nodes
+    let listen_addrs = nodes
         .into_iter()
         .map(|node| (node.node_id, node.listen_addrs))
         .collect();
+    Ok((snapshot, listen_addrs))
+}
 
-    let route = radii_core::routing::resolve_candidates(
-        &snapshot,
-        &listen_addrs,
-        source,
-        std::slice::from_ref(target),
-        allowed_protocols,
-        max_hops,
-        1,
-    )
-    .into_iter()
-    .next();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
 
-    let Some(route) = route else {
-        return Ok(None);
-    };
-    let addr = route.hops.last().expect("non-empty hops").addr.clone();
-    Ok(Some((addr, route.hops.len() + 1, route.score)))
+    #[test]
+    fn plans_across_every_configured_target() {
+        let mut snapshot = GraphSnapshot::new();
+        for (from, to, rtt) in [("s", "t1", 100u32), ("s", "t2", 10)] {
+            snapshot.add_link(Link {
+                from: NodeId(from.into()),
+                to: NodeId(to.into()),
+                protocol: ProtocolId::new("radii"),
+                reachable: true,
+                latency_ms: Some(rtt),
+            });
+        }
+        let listen: HashMap<String, Vec<String>> = [
+            ("t1".to_string(), vec!["10.0.0.1:2224".to_string()]),
+            ("t2".to_string(), vec!["10.0.0.2:2224".to_string()]),
+        ]
+        .into_iter()
+        .collect();
+
+        let routes = plan_from(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t1".into()), NodeId("t2".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            3,
+        );
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].target().0, "t2", "cheaper target ranks first");
+    }
 }

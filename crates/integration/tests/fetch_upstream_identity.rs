@@ -6,7 +6,7 @@
 //! attacker, and upstream mTLS did not help because nothing checked *which*
 //! node answered — only that it held some CA-issued certificate.
 
-use radii_fetch::graph::ResolvedTarget;
+use radii_core::routing::{NodeId, ResolvedHop, ResolvedRoute};
 use radii_fetch::server::run_on_dynamic_with_tls;
 use radii_integration::pki::TestCa;
 use radii_integration::{bind_local, wait_ready};
@@ -38,13 +38,13 @@ async fn run_tls_echo(listener: TcpListener, identity: TlsIdentity) {
 }
 
 async fn tunnel_through(
-    target: Option<ResolvedTarget>,
+    route: Option<ResolvedRoute>,
     listener_tls: Option<TlsIdentity>,
     upstream_tls: Option<TlsIdentity>,
     static_upstream: String,
 ) -> std::io::Result<usize> {
     let (fetch_listener, fetch_addr) = bind_local().await.unwrap();
-    let shared = Arc::new(RwLock::new(target));
+    let shared = Arc::new(RwLock::new(route.into_iter().collect::<Vec<_>>()));
     let handle = tokio::spawn(async move {
         let _ = run_on_dynamic_with_tls(
             fetch_listener,
@@ -81,9 +81,12 @@ async fn refuses_an_upstream_that_is_not_the_intended_node() {
     let echo_handle = tokio::spawn(run_tls_echo(echo_listener, attacker_identity));
 
     let bytes = tunnel_through(
-        Some(ResolvedTarget {
-            addr: echo_addr,
-            node_id: "node-b".into(),
+        Some(ResolvedRoute {
+            hops: vec![ResolvedHop {
+                node_id: NodeId("node-b".into()),
+                addr: echo_addr,
+            }],
+            score: 1.0,
         }),
         None,
         Some(fetch_identity),
@@ -146,9 +149,12 @@ async fn tunnels_to_an_upstream_that_proves_its_node_id() {
     let echo_handle = tokio::spawn(run_tls_echo(echo_listener, node_b_identity));
 
     let bytes = tunnel_through(
-        Some(ResolvedTarget {
-            addr: echo_addr,
-            node_id: "node-b".into(),
+        Some(ResolvedRoute {
+            hops: vec![ResolvedHop {
+                node_id: NodeId("node-b".into()),
+                addr: echo_addr,
+            }],
+            score: 1.0,
         }),
         None,
         Some(fetch_identity),

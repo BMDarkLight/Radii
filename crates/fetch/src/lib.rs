@@ -28,16 +28,16 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
 
     match config.graph {
         Some(graph_config) => {
-            let target: graph::SharedTarget = Arc::new(RwLock::new(None));
+            let routes: graph::SharedRoutes = Arc::new(RwLock::new(Vec::new()));
             tokio::spawn(graph::run_poll(
                 graph_config,
-                Arc::clone(&target),
+                Arc::clone(&routes),
                 graph_tls,
             ));
             server::run_on_dynamic_with_tls(
                 listener,
                 config.upstream,
-                target,
+                routes,
                 listener_tls,
                 upstream_tls,
             )

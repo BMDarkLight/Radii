@@ -1,4 +1,4 @@
-use crate::graph::SharedTarget;
+use crate::graph::SharedRoutes;
 use radii_proto::tls::TlsIdentity;
 use radii_proto::BoxedStream;
 use tokio::net::{TcpListener, TcpStream};
@@ -19,9 +19,9 @@ pub async fn run_on(listener: TcpListener, upstream: &str) -> anyhow::Result<()>
 pub async fn run_on_dynamic(
     listener: TcpListener,
     static_upstream: String,
-    target: SharedTarget,
+    routes: SharedRoutes,
 ) -> anyhow::Result<()> {
-    run_on_dynamic_with_tls(listener, static_upstream, target, None, None).await
+    run_on_dynamic_with_tls(listener, static_upstream, routes, None, None).await
 }
 
 /// Like [`run_on`], additionally requiring mTLS on the inbound side
@@ -52,7 +52,7 @@ pub async fn run_on_with_tls(
 pub async fn run_on_dynamic_with_tls(
     listener: TcpListener,
     static_upstream: String,
-    target: SharedTarget,
+    routes: SharedRoutes,
     listener_tls: Option<TlsIdentity>,
     upstream_tls: Option<TlsIdentity>,
 ) -> anyhow::Result<()> {
@@ -63,9 +63,12 @@ pub async fn run_on_dynamic_with_tls(
         // none: that address came from the operator's own config, which is
         // trusted by definition and may legitimately point at a host with no
         // Radii node identity at all (an SSH daemon, say).
-        let resolved = target.read().ok().and_then(|guard| guard.clone());
+        let resolved = routes.read().ok().and_then(|guard| guard.first().cloned());
         let (upstream, expected_node_id) = match resolved {
-            Some(resolved) => (resolved.addr, Some(resolved.node_id)),
+            Some(route) => {
+                let last = route.hops.last().expect("non-empty hops").clone();
+                (last.addr, Some(last.node_id.0))
+            }
             None => (static_upstream.clone(), None),
         };
         let listener_tls = listener_tls.clone();

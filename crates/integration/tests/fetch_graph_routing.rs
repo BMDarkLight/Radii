@@ -1,5 +1,5 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
-use radii_fetch::graph::{self, SharedTarget};
+use radii_fetch::graph::{self, SharedRoutes};
 use radii_fetch::server::run_on_dynamic;
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::{read_message, write_message, RadiiMessage};
@@ -69,7 +69,7 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
     .unwrap();
     read_message(&mut stream).await.unwrap();
 
-    let target: SharedTarget = Arc::new(RwLock::new(None));
+    let routes: SharedRoutes = Arc::new(RwLock::new(Vec::new()));
     let mut config_file = NamedTempFile::new().unwrap();
     writeln!(config_file, "bind = \"0.0.0.0:0\"").unwrap();
     writeln!(config_file, "upstream = \"127.0.0.1:1\"").unwrap();
@@ -84,11 +84,11 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
         .unwrap()
         .graph
         .expect("graph config present");
-    let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&target), None));
+    let poll_handle = tokio::spawn(graph::run_poll(graph_config, Arc::clone(&routes), None));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if target.read().unwrap().is_some() {
+            if !routes.read().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -97,15 +97,16 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
     .await
     .expect("timed out waiting for fetch to learn the graph target");
     {
-        let guard = target.read().unwrap();
-        let resolved = guard.as_ref().expect("graph target resolved");
-        assert_eq!(resolved.addr, echo_addr);
-        assert_eq!(resolved.node_id, "node-b");
+        let guard = routes.read().unwrap();
+        let resolved = guard.first().expect("graph route resolved");
+        let last = resolved.hops.last().expect("non-empty hops");
+        assert_eq!(last.addr, echo_addr);
+        assert_eq!(last.node_id.0, "node-b");
     }
 
     let (fetch_listener, fetch_addr) = bind_local().await.unwrap();
     let fetch_handle = tokio::spawn(async move {
-        run_on_dynamic(fetch_listener, "127.0.0.1:1".to_string(), target).await
+        run_on_dynamic(fetch_listener, "127.0.0.1:1".to_string(), routes).await
     });
     wait_ready(&fetch_addr).await.unwrap();
 
