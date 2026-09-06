@@ -29,6 +29,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     for warning in [
         config::graph_without_relay_warning(&config),
         config::relay_without_tunnel_listener_tls_warning(&config),
+        config::graph_without_e2e_tls_warning(&config),
     ]
     .into_iter()
     .flatten()

@@ -218,6 +218,34 @@ pub fn relay_without_tunnel_listener_tls_warning(config: &Config) -> Option<&'st
     None
 }
 
+/// Warns when `[graph]` is configured without `[tunnel_tls.upstream]`.
+///
+/// A node with `[graph]` originates chains: it plans a route and calls
+/// `chain::establish`, which uses the very same identity for both the
+/// hop-local dial *and* the end-to-end session with the target (see
+/// `server::connect_upstream`). When `[tunnel_tls.upstream]` is absent,
+/// `tls::connect_on` warns and falls back to a plaintext stream rather than
+/// failing — so the chain still comes up, but its end-to-end layer carries
+/// cleartext that every relay it passes through can read. That directly
+/// contradicts the "relays see only ciphertext" claim made elsewhere (see
+/// `relay.rs`, `README.md`, `SECURITY.md`), so it is worth a loud line at
+/// boot rather than a quiet downgrade discovered later on the wire.
+pub fn graph_without_e2e_tls_warning(config: &Config) -> Option<&'static str> {
+    let has_upstream_tls = config
+        .tunnel_tls
+        .as_ref()
+        .is_some_and(|tls| tls.upstream.is_some());
+    if config.graph.is_some() && !has_upstream_tls {
+        return Some(
+            "[graph] is configured but [tunnel_tls.upstream] is not: this node originates \
+             chains whose end-to-end layer is plaintext, readable by every relay that carries \
+             them. Configure [tunnel_tls.upstream] to give graph-resolved chains real \
+             end-to-end confidentiality.",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +297,43 @@ mod tests {
         writeln!(file, "ca = \"/tmp/ca.pem\"").unwrap();
         let config = load(file.path()).unwrap();
         assert!(relay_without_tunnel_listener_tls_warning(&config).is_some());
+    }
+
+    #[test]
+    fn warns_when_graph_is_configured_without_end_to_end_tls() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        writeln!(file, "[graph]").unwrap();
+        writeln!(file, "crawl_upstream = \"127.0.0.1:7100\"").unwrap();
+        writeln!(file, "target_node_id = \"node-b\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(graph_without_e2e_tls_warning(&config).is_some());
+    }
+
+    #[test]
+    fn does_not_warn_about_end_to_end_tls_without_a_graph_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(graph_without_e2e_tls_warning(&config).is_none());
+    }
+
+    #[test]
+    fn does_not_warn_when_graph_has_end_to_end_tls_configured() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "bind = \"0.0.0.0:2223\"").unwrap();
+        writeln!(file, "upstream = \"127.0.0.1:22\"").unwrap();
+        writeln!(file, "[graph]").unwrap();
+        writeln!(file, "crawl_upstream = \"127.0.0.1:7100\"").unwrap();
+        writeln!(file, "target_node_id = \"node-b\"").unwrap();
+        writeln!(file, "[tunnel_tls.upstream]").unwrap();
+        writeln!(file, "cert = \"/tmp/c.pem\"").unwrap();
+        writeln!(file, "key = \"/tmp/k.pem\"").unwrap();
+        writeln!(file, "ca = \"/tmp/ca.pem\"").unwrap();
+        let config = load(file.path()).unwrap();
+        assert!(graph_without_e2e_tls_warning(&config).is_none());
     }
 
     #[test]

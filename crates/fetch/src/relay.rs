@@ -367,8 +367,13 @@ async fn terminate(
 /// This node is an intermediate hop: dial the next one, pass the tail along,
 /// relay its answer back, then carry opaque bytes in both directions.
 ///
-/// Nothing here inspects the payload. The initiator's end-to-end session runs
-/// inside this pipe, so what crosses it is ciphertext this node cannot read.
+/// Nothing here inspects the payload. When the originator and the terminal
+/// both have `[tunnel_tls]` identities configured, the end-to-end session
+/// runs inside this pipe, so what crosses it is ciphertext this node cannot
+/// read. That holds only when those identities are actually configured —
+/// absent them, `tls::connect_on`/`accept_on` fall back to plaintext, and the
+/// chain this node forwards is cleartext, readable by this node and any
+/// other relay carrying it. See `config::graph_without_e2e_tls_warning`.
 ///
 /// The path is pinned by the originator: this node forwards the tail it was
 /// handed rather than re-planning the next hop from its own view of the
