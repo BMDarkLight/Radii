@@ -10,8 +10,9 @@ use crate::config::RelayConfig;
 use anyhow::{bail, Context, Result};
 use radii_proto::tls::TlsIdentity;
 use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage, RouteHop};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -33,6 +34,13 @@ const KNOWN_ACK_STATUSES: &[&str] = &[
     "tunnel_hop_unreachable",
     "relay_forwarding_unavailable",
     "expected_tunnel_open",
+    // Admission refusals. These must be listed here, not only generated
+    // locally: on a multi-hop chain an admission refusal from a downstream
+    // hop is relayed upstream, and anything outside this vocabulary is
+    // flattened to `UNKNOWN_DOWNSTREAM_STATUS` — which would destroy the
+    // reason exactly when the originator needs it to choose another route.
+    "relay_forbidden",
+    "relay_busy",
     UNKNOWN_DOWNSTREAM_STATUS,
 ];
 
@@ -47,6 +55,41 @@ pub struct RelayRuntime {
     identity: TlsIdentity,
     upstream: String,
     tunnel_listener_tls: Option<TlsIdentity>,
+    live: Mutex<Live>,
+}
+
+/// Chains currently being carried, counted in total and per authenticated
+/// peer. The per-peer tally is the load-bearing half: with admission open to
+/// any CA-valid peer, a global cap alone lets one identity take every slot.
+#[derive(Default)]
+struct Live {
+    total: usize,
+    per_peer: HashMap<String, usize>,
+}
+
+/// Holds one chain's slot. Releasing on `Drop` rather than at an explicit
+/// call site is deliberate: a chain can end by refusal, by error, by timeout,
+/// or by either side closing mid-splice, and a slot that leaks on any of
+/// those paths turns the cap into a permanent lockout after
+/// `max_concurrent_per_peer` connections.
+pub struct Permit {
+    runtime: Arc<RelayRuntime>,
+    peer: String,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut live = self.runtime.live.lock().expect("relay accounting poisoned");
+        live.total = live.total.saturating_sub(1);
+        if let Some(count) = live.per_peer.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                // Drop the entry rather than leaving a zero behind, so the
+                // map tracks live peers instead of every peer ever seen.
+                live.per_peer.remove(&self.peer);
+            }
+        }
+    }
 }
 
 impl RelayRuntime {
@@ -65,7 +108,35 @@ impl RelayRuntime {
             identity,
             upstream,
             tunnel_listener_tls,
+            live: Mutex::new(Live::default()),
         }))
+    }
+
+    /// Admission is CA membership — holding a certificate this relay's CA
+    /// signed — narrowed to an explicit list when the operator sets one.
+    /// An empty `allow_peers` is the open, donated-node posture, not a
+    /// closed door.
+    fn admits(&self, peer: &str) -> bool {
+        self.config.allow_peers.is_empty() || self.config.allow_peers.iter().any(|id| id == peer)
+    }
+
+    /// Takes a slot for `peer`, or `None` when either cap is already met.
+    fn acquire(self: &Arc<Self>, peer: &str) -> Option<Permit> {
+        let mut live = self.live.lock().expect("relay accounting poisoned");
+        if live.total >= self.config.max_concurrent_total {
+            return None;
+        }
+        let count = live.per_peer.entry(peer.to_string()).or_insert(0);
+        if *count >= self.config.max_concurrent_per_peer {
+            // Leave the entry as-is; it is already non-zero by definition.
+            return None;
+        }
+        *count += 1;
+        live.total += 1;
+        Some(Permit {
+            runtime: Arc::clone(self),
+            peer: peer.to_string(),
+        })
     }
 }
 
@@ -103,7 +174,16 @@ async fn handle(
     let bound = Duration::from_millis(runtime.config.handshake_timeout_ms);
     match timeout(bound, handshake(stream, addr, Arc::clone(&runtime))).await {
         Ok(outcome) => match outcome? {
-            Some((a, b)) => splice(a, b).await,
+            // The permit is carried out of the handshake and held for the
+            // whole splice. Dropping it when the handshake returned would
+            // free the slot the instant a chain came up, which is precisely
+            // when the chain starts consuming resources — the cap would
+            // count handshakes rather than live chains and bound nothing.
+            Some((a, b, permit)) => {
+                let result = splice(a, b).await;
+                drop(permit);
+                result
+            }
             None => Ok(()),
         },
         Err(_elapsed) => {
@@ -124,7 +204,7 @@ async fn handshake(
     stream: tokio::net::TcpStream,
     addr: SocketAddr,
     runtime: Arc<RelayRuntime>,
-) -> Result<Option<(BoxedStream, BoxedStream)>> {
+) -> Result<Option<(BoxedStream, BoxedStream, Permit)>> {
     let (mut inbound, peer) = radii_proto::tls::accept(stream, Some(&runtime.identity)).await?;
     let peer = peer.context("relay listener requires mutual TLS")?;
 
@@ -137,17 +217,45 @@ async fn handshake(
         }
     };
 
+    // Admission and accounting run only after the client's frame has been
+    // read. Refusing earlier means closing while the peer is still writing
+    // that frame, and the resulting connection reset reaches it instead of
+    // the status — so the peer learns only that something failed, never
+    // that it was forbidden or that the relay was full. The read is bounded
+    // by the handshake timeout, so hearing an unadmitted peer out first
+    // costs nothing unbounded.
+    if !runtime.admits(&peer) {
+        tracing::warn!(source = %addr, peer = %peer, "relay refused an unadmitted peer");
+        refuse(&mut inbound, "relay_forbidden").await?;
+        return Ok(None);
+    }
+
+    let Some(permit) = runtime.acquire(&peer) else {
+        tracing::warn!(
+            source = %addr,
+            peer = %peer,
+            max_concurrent_total = runtime.config.max_concurrent_total,
+            max_concurrent_per_peer = runtime.config.max_concurrent_per_peer,
+            "relay at capacity"
+        );
+        refuse(&mut inbound, "relay_busy").await?;
+        return Ok(None);
+    };
+
     if let Err(status) = validate(&hops, &runtime.config) {
         tracing::warn!(source = %addr, peer = %peer, status, "relay refused a chain");
         refuse(&mut inbound, status).await?;
         return Ok(None);
     }
 
-    if hops.len() == 1 {
-        return terminate(inbound, runtime).await;
-    }
+    let pair = if hops.len() == 1 {
+        terminate(inbound, runtime).await?
+    } else {
+        forward(inbound, hops, runtime).await?
+    };
 
-    forward(inbound, hops, runtime).await
+    // `permit` drops here on any path that never reaches a splice.
+    Ok(pair.map(|(a, b)| (a, b, permit)))
 }
 
 /// Local, cheap checks made before any dialing happens. Ordered to avoid
@@ -169,6 +277,13 @@ fn validate(hops: &[RouteHop], config: &RelayConfig) -> Result<(), &'static str>
     Ok(())
 }
 
+/// Writes a refusal and closes the write side gracefully.
+///
+/// The shutdown matters: dropping the stream straight after the write lets
+/// the socket close before the peer has read the frame, and the peer then
+/// sees a connection reset instead of the status. A refusal the peer cannot
+/// read is indistinguishable from a crash, and the whole point of a status
+/// vocabulary is that the other end learns *why*.
 async fn refuse(stream: &mut BoxedStream, status: &str) -> Result<()> {
     write_message(
         stream,
@@ -176,7 +291,11 @@ async fn refuse(stream: &mut BoxedStream, status: &str) -> Result<()> {
             status: status.to_string(),
         },
     )
-    .await
+    .await?;
+    // Best-effort: the peer may already be gone, and that is not an error
+    // worth failing the connection over — the refusal is what mattered.
+    let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+    Ok(())
 }
 
 /// This node is the chain's last hop: ack, then run the end-to-end session
