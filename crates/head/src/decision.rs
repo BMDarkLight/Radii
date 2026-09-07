@@ -20,20 +20,50 @@ pub struct DecisionInput<'a> {
     pub attributes: &'a [(&'a str, &'a str)],
 }
 
+/// How a decided backend can be reached.
+///
+/// The two are genuinely different, not two spellings of an address. A
+/// graph-resolved backend is a *node*, reached over a source-routed chain
+/// that terminates at its relay listener — so it needs the node id, which a
+/// bare address cannot carry. A statically configured backend came from the
+/// operator's own config, has no node identity at all, and may legitimately
+/// point at a host that is not part of the mesh.
+#[derive(Clone)]
+pub enum BackendTarget {
+    Chain(Vec<radii_core::routing::ResolvedRoute>),
+    Direct(String),
+}
+
 #[derive(Clone)]
 pub struct BackendDecision {
-    pub backend: String,
-    /// Every reachable backend for this host, best first. `backend` is
-    /// always `candidates[0]` — the static host map and the default policy
-    /// resolve a single answer by construction, so they report a
-    /// single-element list rather than leaving this empty, keeping the
-    /// invariant true on every path.
-    ///
-    /// Head does not proxy, so it cannot fail over itself; exposing the
-    /// ranked list is what lets whatever consumes the decision do so, and
-    /// it is the seam a future reverse proxy will read.
-    pub candidates: Vec<String>,
+    pub target: BackendTarget,
     pub reason: DecisionReason,
+}
+
+impl BackendDecision {
+    /// The address that will be dialed first.
+    pub fn backend(&self) -> String {
+        match &self.target {
+            BackendTarget::Chain(routes) => routes
+                .first()
+                .and_then(|route| route.hops.last())
+                .map(|hop| hop.addr.clone())
+                .unwrap_or_else(|| "unreachable".to_string()),
+            BackendTarget::Direct(addr) => addr.clone(),
+        }
+    }
+
+    /// Every address that could be dialed, best first. `backend()` is always
+    /// the first, on every path.
+    pub fn candidates(&self) -> Vec<String> {
+        match &self.target {
+            BackendTarget::Chain(routes) => routes
+                .iter()
+                .filter_map(|route| route.hops.last().map(|hop| hop.addr.clone()))
+                .collect(),
+            BackendTarget::Direct(addr) => vec![addr.clone()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,13 +124,12 @@ impl DecisionEngine {
 
         // No policy matched. Both real constructors append a `DefaultPolicy`
         // that always answers, so this is reachable only through a hand-built
-        // engine — but `candidates[0] == backend` is documented to hold on
+        // engine — but `candidates()[0] == backend()` is documented to hold on
         // every path, and a consumer should not have to know which paths are
-        // live to rely on it. The sentinel goes in both fields or neither.
-        let backend = "unreachable".to_string();
+        // live to rely on it. `Direct("unreachable")` reports the sentinel
+        // from both methods, keeping the invariant true here too.
         BackendDecision {
-            candidates: vec![backend.clone()],
-            backend,
+            target: BackendTarget::Direct("unreachable".to_string()),
             reason: DecisionReason::Default,
         }
     }
@@ -152,7 +181,7 @@ impl DecisionPolicy for GraphRoutePolicy {
     fn evaluate(&self, input: &DecisionInput<'_>) -> Option<BackendDecision> {
         let host = input.host?;
         let targets = self.node_map.get(host)?;
-        let resolved = graph::plan_backends(
+        let routes = graph::plan_backends(
             &self.state,
             &self.source,
             targets,
@@ -160,19 +189,19 @@ impl DecisionPolicy for GraphRoutePolicy {
             self.max_hops,
             self.max_candidates,
         );
-        let candidates: Vec<String> = resolved.iter().map(|(addr, _, _)| addr.clone()).collect();
-        let (backend, hops, score) = resolved.into_iter().next()?;
+        if routes.is_empty() {
+            return None;
+        }
         tracing::debug!(
             host,
-            backend = %backend,
-            hops,
-            score,
-            candidates = candidates.len(),
+            backend = %routes[0].hops.last().map(|hop| hop.addr.as_str()).unwrap_or("unreachable"),
+            hops = routes[0].hops.len(),
+            score = routes[0].score,
+            candidates = routes.len(),
             "graph route matched"
         );
         Some(BackendDecision {
-            backend,
-            candidates,
+            target: BackendTarget::Chain(routes),
             reason: DecisionReason::GraphRoute,
         })
     }
@@ -193,8 +222,7 @@ impl DecisionPolicy for HostMapPolicy {
         let host = input.host?;
         let backend = self.host_map.get(host)?;
         Some(BackendDecision {
-            backend: backend.clone(),
-            candidates: vec![backend.clone()],
+            target: BackendTarget::Direct(backend.clone()),
             reason: DecisionReason::HostMatch,
         })
     }
@@ -213,8 +241,7 @@ impl DefaultPolicy {
 impl DecisionPolicy for DefaultPolicy {
     fn evaluate(&self, _input: &DecisionInput<'_>) -> Option<BackendDecision> {
         Some(BackendDecision {
-            backend: self.backend.clone(),
-            candidates: vec![self.backend.clone()],
+            target: BackendTarget::Direct(self.backend.clone()),
             reason: DecisionReason::Default,
         })
     }
@@ -234,10 +261,10 @@ mod tests {
     fn the_unmatched_sentinel_keeps_candidates_aligned_with_backend() {
         let decision = DecisionEngine::new().decide(input(Some("anything.example")));
 
-        assert_eq!(decision.backend, "unreachable");
+        assert_eq!(decision.backend(), "unreachable");
         assert_eq!(
-            decision.candidates.first(),
-            Some(&decision.backend),
+            decision.candidates().first(),
+            Some(&decision.backend()),
             "candidates[0] must equal backend even when no policy matched"
         );
     }
@@ -263,20 +290,20 @@ mod tests {
         });
 
         let matched = engine.decide(input(Some("example.com")));
-        assert_eq!(matched.backend, "http://10.0.0.10:9000");
+        assert_eq!(matched.backend(), "http://10.0.0.10:9000");
         assert!(matches!(matched.reason, DecisionReason::HostMatch));
         assert_eq!(
-            matched.candidates.first(),
-            Some(&matched.backend),
+            matched.candidates().first(),
+            Some(&matched.backend()),
             "candidates[0] must equal backend on a host-map hit"
         );
 
         let fallback = engine.decide(input(Some("other.example")));
-        assert_eq!(fallback.backend, "http://127.0.0.1:9000");
+        assert_eq!(fallback.backend(), "http://127.0.0.1:9000");
         assert!(matches!(fallback.reason, DecisionReason::Default));
         assert_eq!(
-            fallback.candidates.first(),
-            Some(&fallback.backend),
+            fallback.candidates().first(),
+            Some(&fallback.backend()),
             "candidates[0] must equal backend on the default fallback"
         );
     }
@@ -285,7 +312,7 @@ mod tests {
     fn empty_engine_returns_unreachable() {
         let engine = DecisionEngine::new();
         let decision = engine.decide(input(None));
-        assert_eq!(decision.backend, "unreachable");
+        assert_eq!(decision.backend(), "unreachable");
     }
 
     fn graph_state_with_reachable_route() -> SharedGraphState {
@@ -304,7 +331,7 @@ mod tests {
         let mut listen_addrs = HashMap::new();
         listen_addrs.insert(
             "node-b".to_string(),
-            vec![("10.0.0.5:9000".to_string(), "http".to_string())],
+            vec![("10.0.0.5:9000".to_string(), "relay".to_string())],
         );
         Arc::new(RwLock::new(GraphState {
             snapshot,
@@ -337,8 +364,54 @@ mod tests {
         );
 
         let matched = engine.decide(input(Some("example.com")));
-        assert_eq!(matched.backend, "10.0.0.5:9000");
+        assert_eq!(matched.backend(), "10.0.0.5:9000");
         assert!(matches!(matched.reason, DecisionReason::GraphRoute));
+    }
+
+    #[test]
+    fn a_static_host_map_hit_is_a_direct_target() {
+        let mut host_map = HashMap::new();
+        host_map.insert(
+            "example.com".to_string(),
+            "http://10.0.0.10:9000".to_string(),
+        );
+        let engine = DecisionEngine::from_config(&RoutingConfig {
+            default_backend: "http://127.0.0.1:9000".into(),
+            host_map,
+        });
+
+        let decision = engine.decide(input(Some("example.com")));
+        assert!(matches!(decision.target, BackendTarget::Direct(_)));
+        assert_eq!(decision.backend(), "http://10.0.0.10:9000");
+        assert_eq!(
+            decision.candidates(),
+            vec!["http://10.0.0.10:9000".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_graph_route_is_a_chain_target_carrying_node_ids() {
+        let state = graph_state_with_reachable_route();
+        let mut node_map = HashMap::new();
+        node_map.insert("example.com".to_string(), vec!["node-b".to_string()]);
+        let policy = GraphRoutePolicy::new(
+            node_map,
+            "head".to_string(),
+            vec!["http".to_string()],
+            4,
+            3,
+            state,
+        );
+        let engine = DecisionEngine::new().with_policy(policy);
+
+        let decision = engine.decide(input(Some("example.com")));
+        let BackendTarget::Chain(routes) = &decision.target else {
+            panic!("expected a chain target, got a direct one");
+        };
+        // The node id is what `chain::establish` needs and what a bare
+        // address string cannot carry.
+        assert_eq!(routes[0].target().0, "node-b");
+        assert_eq!(decision.backend(), routes[0].hops.last().unwrap().addr);
     }
 
     #[test]
@@ -358,7 +431,7 @@ mod tests {
         );
 
         let fallback = engine.decide(input(Some("example.com")));
-        assert_eq!(fallback.backend, "http://10.0.0.10:9000");
+        assert_eq!(fallback.backend(), "http://10.0.0.10:9000");
         assert!(matches!(fallback.reason, DecisionReason::HostMatch));
     }
 }

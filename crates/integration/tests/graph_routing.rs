@@ -32,7 +32,7 @@ async fn head_resolves_backend_from_crawl_graph() {
             roles: vec!["resource".into()],
             listen_addrs: vec![ListenAddr {
                 addr: "10.0.0.5:9000".into(),
-                role: "http".into(),
+                role: "relay".into(),
             }],
         },
     )

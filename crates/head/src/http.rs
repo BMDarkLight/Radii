@@ -77,7 +77,7 @@ async fn handle_request(
     tracing::info!(
         source = %connect.0,
         host = ?host_value,
-        backend = %decision.backend,
+        backend = %decision.backend(),
         reason = ?decision.reason,
         "head received request"
     );
@@ -91,8 +91,8 @@ async fn handle_request(
     Ok(Json(HeadResponse {
         source_ip: connect.0.to_string(),
         host: host_value,
-        backend: decision.backend,
-        candidates: decision.candidates,
+        backend: decision.backend(),
+        candidates: decision.candidates(),
         decision_reason: reason.to_string(),
     }))
 }

@@ -80,42 +80,14 @@ async fn fetch_once(
     Ok((snapshot, listen_addrs))
 }
 
-/// Finds the best-scoring reachable route from `source` to `target` in the
-/// live graph and resolves it to one of the target node's listen addresses.
-pub fn plan_backend(
-    state: &SharedGraphState,
-    source: &NodeId,
-    target: &NodeId,
-    allowed_protocols: &[ProtocolId],
-    max_hops: usize,
-) -> Option<(String, usize, f64)> {
-    let guard = state.read().ok()?;
-    let route = radii_core::routing::resolve_candidates(
-        &guard.snapshot,
-        &guard.listen_addrs,
-        source,
-        std::slice::from_ref(target),
-        allowed_protocols,
-        max_hops,
-        1,
-        None,
-        &RoleId::new(RoleId::HTTP),
-    )
-    .into_iter()
-    .next()?;
-
-    let addr = route.hops.last()?.addr.clone();
-    // `hops` excludes the source; the old contract counted it.
-    Some((addr, route.hops.len() + 1, route.score))
-}
-
 /// All reachable backends for `targets`, best first.
 ///
-/// Head resolves the target's `http` address — the endpoint its caller will
-/// dial directly — and passes `None` for the hop role because it dials no
-/// intermediate. Fetch resolves `relay` addresses instead, for every hop.
-/// The role tag is what lets one registry entry serve both without either
-/// consumer reading the other's address.
+/// Head reaches a decided backend over a source-routed chain, which
+/// terminates at the target's `relay` listener and splices to that node's
+/// own configured upstream — the same listener Fetch resolves for every hop
+/// of a chain it establishes. Resolving `http` here would name an endpoint
+/// Head never dials directly once it proxies over chains, so it resolves the
+/// same role Fetch does.
 pub fn plan_backends(
     state: &SharedGraphState,
     source: &NodeId,
@@ -123,7 +95,7 @@ pub fn plan_backends(
     allowed_protocols: &[ProtocolId],
     max_hops: usize,
     limit: usize,
-) -> Vec<(String, usize, f64)> {
+) -> Vec<radii_core::routing::ResolvedRoute> {
     let Ok(guard) = state.read() else {
         return Vec::new();
     };
@@ -136,21 +108,8 @@ pub fn plan_backends(
         max_hops,
         limit,
         None,
-        &RoleId::new(RoleId::HTTP),
+        &RoleId::new(RoleId::RELAY),
     )
-    .into_iter()
-    .map(|route| {
-        let addr = route
-            .hops
-            .last()
-            .expect("ResolvedRoute::hops is non-empty by construction")
-            .addr
-            .clone();
-        // `hops` excludes the source; the reported count includes it, so the
-        // number matches what `plan_backend` has always returned.
-        (addr, route.hops.len() + 1, route.score)
-    })
-    .collect()
 }
 
 #[cfg(test)]
@@ -171,7 +130,7 @@ mod tests {
         let mut listen_addrs = HashMap::new();
         listen_addrs.insert(
             "node-b".to_string(),
-            vec![("10.0.0.5:9000".to_string(), "http".to_string())],
+            vec![("10.0.0.5:9000".to_string(), "relay".to_string())],
         );
         Arc::new(RwLock::new(GraphState {
             snapshot,
@@ -182,28 +141,30 @@ mod tests {
     #[test]
     fn resolves_backend_for_reachable_route() {
         let state = state_with(vec![("head", "node-b", "http", true, Some(15))]);
-        let backend = plan_backend(
+        let routes = plan_backends(
             &state,
             &NodeId("head".into()),
-            &NodeId("node-b".into()),
+            &[NodeId("node-b".into())],
             &[ProtocolId::new("http")],
             4,
+            3,
         );
-        let (addr, hops, _score) = backend.expect("expected a route");
-        assert_eq!(addr, "10.0.0.5:9000");
-        assert_eq!(hops, 2);
+        let route = routes.first().expect("expected a route");
+        assert_eq!(route.hops.last().unwrap().addr, "10.0.0.5:9000");
+        assert_eq!(route.hops.len(), 1);
     }
 
     #[test]
     fn returns_none_when_target_unreachable() {
         let state = state_with(vec![("head", "node-b", "http", false, Some(15))]);
-        let backend = plan_backend(
+        let routes = plan_backends(
             &state,
             &NodeId("head".into()),
-            &NodeId("node-b".into()),
+            &[NodeId("node-b".into())],
             &[ProtocolId::new("http")],
             4,
+            3,
         );
-        assert!(backend.is_none());
+        assert!(routes.is_empty());
     }
 }

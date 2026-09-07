@@ -1134,6 +1134,7 @@ dependencies = [
  "axum",
  "clap",
  "radii-core",
+ "radii-fetch",
  "radii-proto",
  "serde",
  "serde_json",
