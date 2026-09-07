@@ -48,7 +48,10 @@ decision JSON:
 }
 ```
 
-`backend` is the first candidate, so existing consumers are unaffected.
+`backend` is always the first candidate — on the graph path, on the
+host-map and default fallbacks, and on the no-policy-matched sentinel alike —
+so existing consumers reading only `backend` are unaffected, and a consumer
+iterating `candidates` never has to special-case an empty list.
 
 **Head does not proxy**, so it cannot fail over itself — it returns a decision
 and the caller dials it. The `candidates` list is what lets that caller fail

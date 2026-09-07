@@ -92,9 +92,15 @@ impl DecisionEngine {
             }
         }
 
+        // No policy matched. Both real constructors append a `DefaultPolicy`
+        // that always answers, so this is reachable only through a hand-built
+        // engine — but `candidates[0] == backend` is documented to hold on
+        // every path, and a consumer should not have to know which paths are
+        // live to rely on it. The sentinel goes in both fields or neither.
+        let backend = "unreachable".to_string();
         BackendDecision {
-            backend: "unreachable".to_string(),
-            candidates: Vec::new(),
+            candidates: vec![backend.clone()],
+            backend,
             reason: DecisionReason::Default,
         }
     }
@@ -218,6 +224,23 @@ impl DecisionPolicy for DefaultPolicy {
 mod tests {
     use super::*;
     use crate::config::RoutingConfig;
+
+    /// `candidates[0] == backend` must hold on EVERY path, including the
+    /// no-policy-matched sentinel. Both real constructors append a
+    /// `DefaultPolicy` that always answers, so this path is reachable only
+    /// through a hand-built engine — but a consumer written against the
+    /// documented invariant should not have to know that.
+    #[test]
+    fn the_unmatched_sentinel_keeps_candidates_aligned_with_backend() {
+        let decision = DecisionEngine::new().decide(input(Some("anything.example")));
+
+        assert_eq!(decision.backend, "unreachable");
+        assert_eq!(
+            decision.candidates.first(),
+            Some(&decision.backend),
+            "candidates[0] must equal backend even when no policy matched"
+        );
+    }
 
     fn input(host: Option<&str>) -> DecisionInput<'_> {
         DecisionInput {
