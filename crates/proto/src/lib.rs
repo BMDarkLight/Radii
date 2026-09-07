@@ -367,30 +367,48 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
         }
     }
 
-    if let RadiiMessage::NodeHello { listen_addrs, .. } = &message {
-        if listen_addrs.len() > MAX_LISTEN_ADDRS {
-            bail!(
-                "node_hello listen_addrs count {} exceeds {MAX_LISTEN_ADDRS}",
-                listen_addrs.len()
-            );
-        }
-        for entry in listen_addrs {
-            if entry.addr.len() > MAX_LISTEN_ADDR_LEN {
-                bail!(
-                    "node_hello listen address length {} exceeds {MAX_LISTEN_ADDR_LEN}",
-                    entry.addr.len()
-                );
-            }
-            if entry.role.len() > MAX_ROLE_LEN {
-                bail!(
-                    "node_hello listen address role length {} exceeds {MAX_ROLE_LEN}",
-                    entry.role.len()
-                );
-            }
-        }
+    // Both shapes a `NodeHello` can arrive in. A hello relayed through a
+    // Head bridge is wrapped in `FromHead`, so matching only the direct
+    // shape would leave the bound reachable-around by going via a Head —
+    // which is exactly the path Head exists to provide.
+    match &message {
+        RadiiMessage::NodeHello { listen_addrs, .. }
+        | RadiiMessage::FromHead {
+            message: RelayedMessage::NodeHello { listen_addrs, .. },
+            ..
+        } => validate_listen_addrs(listen_addrs)?,
+        _ => {}
     }
 
     Ok(message)
+}
+
+/// Bounds a peer-supplied listen-address list.
+///
+/// Shared by the direct and the Head-relayed `NodeHello` paths so the two
+/// cannot drift: a limit enforced on only one of them is not a limit.
+fn validate_listen_addrs(listen_addrs: &[ListenAddr]) -> Result<()> {
+    if listen_addrs.len() > MAX_LISTEN_ADDRS {
+        bail!(
+            "node_hello listen_addrs count {} exceeds {MAX_LISTEN_ADDRS}",
+            listen_addrs.len()
+        );
+    }
+    for entry in listen_addrs {
+        if entry.addr.len() > MAX_LISTEN_ADDR_LEN {
+            bail!(
+                "node_hello listen address length {} exceeds {MAX_LISTEN_ADDR_LEN}",
+                entry.addr.len()
+            );
+        }
+        if entry.role.len() > MAX_ROLE_LEN {
+            bail!(
+                "node_hello listen address role length {} exceeds {MAX_ROLE_LEN}",
+                entry.role.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -769,6 +787,43 @@ mod tests {
 
         let err = read_message(&mut buf.as_slice()).await.unwrap_err();
         assert!(err.to_string().contains("address"), "got: {err}");
+    }
+
+    /// The listen-address bounds must cover a `NodeHello` relayed through a
+    /// Head bridge, not only a direct one. Head's whole purpose on this path
+    /// is forwarding a client's hello to Crawl inside a `FromHead` envelope,
+    /// so a bound that only matches the direct shape is one an attacker
+    /// reaches Crawl through by simply going via a Head.
+    #[tokio::test]
+    async fn rejects_a_relayed_hello_with_too_many_listen_addrs() {
+        let listen_addrs = (0..=MAX_LISTEN_ADDRS)
+            .map(|i| ListenAddr {
+                addr: format!("10.0.0.1:{i}"),
+                role: "relay".into(),
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &RadiiMessage::FromHead {
+                source: "127.0.0.1:1".into(),
+                client_identity: Some("node-c".into()),
+                message: RelayedMessage::NodeHello {
+                    node_id: "node-c".into(),
+                    roles: vec![],
+                    listen_addrs,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("listen_addrs"),
+            "a relayed hello must be bounded too; got: {err}"
+        );
     }
 
     #[tokio::test]
