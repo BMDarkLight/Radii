@@ -129,6 +129,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Relayed status sanitisation | `radii-fetch` (`relay::KNOWN_ACK_STATUSES`) | A downstream hop's reply is relayed upstream, so only an `Ack` is ever forwarded and only with a status from a closed vocabulary; anything else becomes one fixed local code. Without this a compromised hop could push up to `MAX_FRAME_LEN` of arbitrary text — newlines, escapes — through every upstream node's logs |
 | End-to-end tunnel identity | `radii-fetch` (`chain::establish`) | Two nested TLS sessions authenticate different peers: the hop-local one authenticates the first relay dialed, the end-to-end one authenticates the final target. **This holds only when `[tunnel_tls]` identities are actually configured on the originating and terminal nodes.** Without them, `tls::connect_on`/`accept_on` fall back to plaintext and a relay carrying the chain sees cleartext, not ciphertext — Fetch warns at startup when `[graph]` is configured without `[tunnel_tls.upstream]` (`config::graph_without_e2e_tls_warning`) |
 | Upstream node verification | `radii-fetch`, `radii-proto` (`tls::dial_expecting`) | When Fetch dials a graph-resolved upstream over mTLS, the peer's certificate CN must match the node id the route was planned to — a poisoned `listen_addrs` cannot silently redirect the tunnel to another CA-issued host |
+| Role-tagged listen addresses | `radii-proto` (`ListenAddr`), `radii-core` (`RoleId`) | Each advertised address carries the role it serves, so Fetch resolves `relay` listeners and Head `http` backends from one registry entry without either reading the other's address. Decode bounds the list (`MAX_LISTEN_ADDRS` = 16) and each string (`MAX_LISTEN_ADDR_LEN` = 256, `MAX_ROLE_LEN` = 64), closing a previously unbounded growth path into Crawl's registry |
 
 ### What is NOT implemented (treat as known gaps)
 
@@ -143,7 +144,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Relays observe traffic patterns | Payloads are opaque to a relay, but it sees volume, timing, and its immediate neighbours. There is no padding and no cover traffic — **this is not anonymity** and must not be described as such |
 | A relay can deny service to a chain it carries | It can stall or drop. It cannot read or impersonate the endpoint. Ranked-candidate retry is the mitigation, not prevention |
 | Retry stops at the end-to-end handshake | Once application bytes flow, TCP offers no way to migrate a stream, so a mid-stream failure reaches the client as a closed connection rather than being retried onto another candidate |
-| `listen_addrs` has two incompatible readings | Fetch treats a node's advertised address as a relay listener (mutual TLS, `TunnelOpen` preamble); Head reads the same registry entry and hands it to callers as a plain backend to dial. A node advertising a relay listener will be given to Head's callers as though it were an HTTP backend, and the failure looks like a backend outage. Resolving this needs separate address roles per node, or a role tag in the registry |
+| An address role is a claim, not a credential | A node advertising `role = "relay"` may run nothing there: the chain fails at dial, the candidate is discarded, and retry moves on — bounded by `attempt_timeout_ms`. A false `role = "http"` is weaker, because Head does not dial and so cannot verify; its caller discovers the lie. Not a new exposure — Head hands out unverified addresses today — but a role tag makes a claim more *specific* without making it more *trustworthy* |
 | No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch, TLS-authenticated or not |
 | Unbounded graph state | Crawl's reachability log only ever grows, and route planning over a dense graph is super-linear — a peer permitted to report can drive memory and CPU up with a modest number of messages |
 | Fetch is an open TCP tunnel to configured upstream | Misbind + exposure ≈ proxy to internal services |
@@ -171,26 +172,18 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 Graph-resolved traffic is delivered over the relay protocol. **Even a one-hop
 route terminates at the target's relay listener**, which then splices to that
 node's own configured `upstream` — there is no raw-dial shortcut for short
-routes, because a node's single advertised address is used both as an
-intermediate hop in a long route and as the target of a short one, and it
-cannot be a relay port and a plain tunnel port at the same time.
+routes. A node advertises its relay listener and its HTTP backend as
+separate role-tagged entries in `listen_addrs`: Fetch resolves the `relay`
+one for every hop it plans, Head resolves the `http` one for the backend it
+hands its callers, and the two no longer share one ambiguous address.
 
 Two consequences, and both are operator-visible:
 
-- [ ] **Any node that can appear in a resolved route — including as a route's
-      target — must run `[relay]`, and must advertise *that listener's*
-      address in its `listen_addrs`.** `listen_addrs` is hand-typed
-      (`radii-cli hello --listen-addrs ...`) and nothing validates it. A node
-      still advertising a plain tunnel port will complete the hop-local
-      handshake and then have `TunnelOpen` framing bytes spliced straight into
-      its upstream backend, after which every candidate fails and traffic
-      degrades silently to the static `upstream`. **Fetch has no startup
-      warning for this — a `[graph]`-configured node with `[relay]` present
-      but a wrong `listen_addrs` value looks fully configured and only fails
-      on the wire.** The only related warning fires when `[relay]` is missing
-      *entirely* (`config::graph_without_relay_warning`), which does not
-      catch a `[relay]` section that is present but advertised under the
-      wrong address.
+- [ ] Advertise each listener with its role: `--listen-addr relay=HOST:PORT`
+      for a node that carries chains, `--listen-addr http=HOST:PORT` for one
+      Head should hand out as a backend. A node advertising no `relay`
+      address is simply never selected as a Fetch route target — wrong
+      configuration means *not chosen* rather than *chosen and corrupting*.
 - [ ] **A node that terminates chains must configure `[tunnel_tls.listener]`.**
       The end-to-end session is the only thing authenticating an originator
       once chains exceed one hop — at length one the originator is the peer the

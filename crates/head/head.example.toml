@@ -27,6 +27,9 @@ max_candidates = 3
 
 # A host may name several nodes. Head plans to all of them and reports the
 # reachable ones best-first. A bare string still works for a single node.
+# Every mapped node must advertise an `http`-role listen address (e.g.
+# `--listen-addr http=HOST:PORT`) — that is the address Head resolves and
+# hands to its callers.
 [graph.node_map]
 "example.com" = ["node-b", "node-c"]
 "single.example.com" = "node-b"

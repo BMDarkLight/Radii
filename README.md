@@ -112,7 +112,7 @@ printf '%s\n' \
 
 ## What works today
 
-- **Crawl:** accepts `NodeHello`, probes, and reports over the Radii TCP protocol; keeps an in-memory view; acknowledges messages.
+- **Crawl:** accepts `NodeHello`, probes, and reports over the Radii TCP protocol; keeps an in-memory view; acknowledges messages. Advertised node addresses are role-tagged (`relay`, `http`, ...), so Fetch and Head each resolve the role meant for them from the same registry entry.
 - **Head:** HTTP `/health`; other paths return a JSON backend decision — resolved from Crawl's live reachability graph when configured, falling back to a host map, then a default; a host may map to several nodes, and the response carries every reachable backend best-first in `candidates` so a caller can fail over. Optional Radii listener that forwards to Crawl.
 - **Fetch:** TCP tunnel from `bind` to an upstream, reached either directly or over a source-routed chain of relays. Routes come from Crawl's reachability graph as a ranked candidate list spanning several paths *and* several target nodes; a failed candidate falls over to the next, and an exhausted list falls back to the static `upstream` (`ssh://` / `tcp://` prefixes stripped). When both the originating and terminal nodes have `[tunnel_tls]` identities configured, relays carry end-to-end-encrypted bytes they cannot read; without those identities the end-to-end layer falls back to plaintext and a carrying relay can read it. Relaying is opt-in per node (`[relay]`), requires mutual TLS, and is bounded by per-peer and global concurrency caps, a handshake deadline, and an idle deadline.
 - **core/cli:** graph snapshot + route planner; CLI hello/report/plan.

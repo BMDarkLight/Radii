@@ -75,9 +75,10 @@ buffering client traffic in the hope of replaying it.
 ### Deployment requirement
 
 Any node that can appear in a resolved route — **including as a route's
-target** — must run `[relay]` and advertise *that listener's* address in its
-`listen_addrs`. See the source-routing section of [`SECURITY.md`](../../SECURITY.md)
-for why, and for what breaks if it advertises a plain tunnel port instead.
+target** — must run `[relay]` and advertise *that listener's* address under
+the `relay` role, e.g. `--listen-addr relay=HOST:PORT`. A node advertising no
+`relay` address is simply never selected as a Fetch route target. See the
+source-routing section of [`SECURITY.md`](../../SECURITY.md) for more.
 
 ### Two allowances, and why they cannot be one
 

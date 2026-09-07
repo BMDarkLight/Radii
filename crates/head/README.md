@@ -57,14 +57,10 @@ iterating `candidates` never has to special-case an empty list.
 and the caller dials it. The `candidates` list is what lets that caller fail
 over, and it is the seam a future reverse proxy will read.
 
-### One caveat worth knowing
+### Address roles
 
-Head and Fetch read the *same* node registry but disagree about what an
-address means. Fetch treats a node's advertised address as a relay listener —
-one that requires mutual TLS and a `TunnelOpen` preamble. Head assumes the
-plain-backend reading and hands the address to its caller to dial directly. A
-node advertising a relay listener will therefore be given to Head's callers as
-though it were an HTTP backend, and the failure will look like a backend
-outage. Resolving this needs separate address roles per node, or a role tag in
-the registry; both are protocol changes. See the residual-risk table in
-[`SECURITY.md`](../../SECURITY.md).
+Head and Fetch read the same node registry, but each resolves a different
+role from a node's advertised addresses: Head resolves the `http` role for
+the backend it hands its callers, Fetch resolves the `relay` role for every
+hop it plans. A node that should serve both must advertise both, e.g.
+`--listen-addr relay=HOST:PORT --listen-addr http=HOST:PORT`.
