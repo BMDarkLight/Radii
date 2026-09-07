@@ -45,6 +45,13 @@ attempt_timeout_ms = 3000
 # max_hops = 8
 # max_concurrent_total = 256
 # max_concurrent_per_peer = 8
+# Pre-admission bounds. These ration the handshake window itself, which the
+# caps above cannot reach: they are keyed by the authenticated peer id, and
+# that id is what the handshake produces. Keyed by source address instead,
+# which is blunt where peers share a NAT — set it above a legitimate peer's
+# concurrent-chain allowance, not tightly.
+# max_pending_total = 256
+# max_pending_per_addr = 16
 # idle_timeout_ms = 30000
 # handshake_timeout_ms = 10000  # bounds the pre-splice handshake, not the tunnel itself
 # allow_peers = []              # empty = any peer with a CA-valid certificate

@@ -72,6 +72,8 @@ async fn run_starts_the_relay_listener_when_configured() {
             max_concurrent_per_peer: 4,
             idle_timeout_ms: 30_000,
             handshake_timeout_ms: 10_000,
+            max_pending_total: 256,
+            max_pending_per_addr: 16,
             allow_peers: Vec::new(),
             tls: Some(ca.issue("node-t")),
         }),

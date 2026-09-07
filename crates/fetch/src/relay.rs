@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use radii_proto::tls::TlsIdentity;
 use radii_proto::{read_message, write_message, BoxedStream, RadiiMessage, RouteHop};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -65,6 +65,8 @@ pub struct RelayRuntime {
 struct Live {
     total: usize,
     per_peer: HashMap<String, usize>,
+    pending_total: usize,
+    pending_per_addr: HashMap<IpAddr, usize>,
 }
 
 /// Holds one chain's slot. Releasing on `Drop` rather than at an explicit
@@ -87,6 +89,32 @@ impl Drop for Permit {
                 // Drop the entry rather than leaving a zero behind, so the
                 // map tracks live peers instead of every peer ever seen.
                 live.per_peer.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Holds a slot in the pre-admission window — accepted, but not yet through
+/// the mTLS handshake and first frame.
+///
+/// Released as soon as the handshake resolves, either into an admitted chain
+/// (which then holds a [`Permit`] instead) or into a refusal. The two are
+/// deliberately separate allowances: a long-lived chain must not occupy a
+/// handshake slot for hours, and a stalled handshake must not consume a
+/// chain slot it never earned.
+pub struct PendingPermit {
+    runtime: Arc<RelayRuntime>,
+    addr: IpAddr,
+}
+
+impl Drop for PendingPermit {
+    fn drop(&mut self) {
+        let mut live = self.runtime.live.lock().expect("relay accounting poisoned");
+        live.pending_total = live.pending_total.saturating_sub(1);
+        if let Some(count) = live.pending_per_addr.get_mut(&self.addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                live.pending_per_addr.remove(&self.addr);
             }
         }
     }
@@ -132,6 +160,29 @@ impl RelayRuntime {
         self.config.allow_peers.is_empty() || self.config.allow_peers.iter().any(|id| id == peer)
     }
 
+    /// Takes a pre-admission slot for a connection from `addr`, or `None`
+    /// when either pre-admission cap is already met.
+    ///
+    /// Called before the TLS handshake starts, which is the whole point: a
+    /// connection refused here costs one accept and one close, not a
+    /// handshake held open for `handshake_timeout_ms`.
+    fn acquire_pending(self: &Arc<Self>, addr: IpAddr) -> Option<PendingPermit> {
+        let mut live = self.live.lock().expect("relay accounting poisoned");
+        if live.pending_total >= self.config.max_pending_total {
+            return None;
+        }
+        let count = live.pending_per_addr.entry(addr).or_insert(0);
+        if *count >= self.config.max_pending_per_addr {
+            return None;
+        }
+        *count += 1;
+        live.pending_total += 1;
+        Some(PendingPermit {
+            runtime: Arc::clone(self),
+            addr,
+        })
+    }
+
     /// Takes a slot for `peer`, or `None` when either cap is already met.
     fn acquire(self: &Arc<Self>, peer: &str) -> Option<Permit> {
         let mut live = self.live.lock().expect("relay accounting poisoned");
@@ -160,9 +211,28 @@ pub async fn run(listener: TcpListener, runtime: Arc<RelayRuntime>) -> Result<()
     );
     loop {
         let (stream, addr) = listener.accept().await?;
+
+        // Taken before the task is spawned and before any handshake begins.
+        // A connection refused here has cost one accept and one close; one
+        // admitted past this point can cost a TLS handshake and a task for
+        // up to `handshake_timeout_ms`, which is exactly the budget being
+        // rationed. The peer gets a plain TCP close, because sending it a
+        // Radii status would require completing the handshake we are
+        // declining to spend.
+        let Some(pending) = runtime.acquire_pending(addr.ip()) else {
+            tracing::warn!(
+                source = %addr,
+                max_pending_total = runtime.config.max_pending_total,
+                max_pending_per_addr = runtime.config.max_pending_per_addr,
+                "relay at pre-admission capacity; closing before the handshake"
+            );
+            drop(stream);
+            continue;
+        };
+
         let runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
-            if let Err(err) = handle(stream, addr, runtime).await {
+            if let Err(err) = handle(stream, addr, runtime, pending).await {
                 tracing::warn!(source = %addr, error = %err, "relay connection failed");
             }
         });
@@ -182,6 +252,7 @@ async fn handle(
     stream: tokio::net::TcpStream,
     addr: SocketAddr,
     runtime: Arc<RelayRuntime>,
+    pending: PendingPermit,
 ) -> Result<()> {
     let bound = Duration::from_millis(runtime.config.handshake_timeout_ms);
     match timeout(bound, handshake(stream, addr, Arc::clone(&runtime))).await {
@@ -192,6 +263,10 @@ async fn handle(
             // when the chain starts consuming resources — the cap would
             // count handshakes rather than live chains and bound nothing.
             Some((a, b, permit)) => {
+                // Admitted: the chain permit governs from here, so hand the
+                // handshake slot back rather than holding both for the life
+                // of the tunnel.
+                drop(pending);
                 let idle = Duration::from_millis(runtime.config.idle_timeout_ms.max(1));
                 let result = splice_with_idle(a, b, idle).await;
                 drop(permit);

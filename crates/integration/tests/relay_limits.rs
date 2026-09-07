@@ -39,6 +39,8 @@ fn relay_config(ca: &TestCa, node_id: &str, bind: &str) -> radii_fetch::config::
         max_concurrent_per_peer: 4,
         idle_timeout_ms: 30_000,
         handshake_timeout_ms: 10_000,
+        max_pending_total: 256,
+        max_pending_per_addr: 16,
         allow_peers: Vec::new(),
         tls: Some(ca.issue(node_id)),
     }
@@ -384,5 +386,132 @@ async fn keeps_a_busy_chain_alive_past_the_idle_window() {
             .expect("a chain carrying traffic must not be dropped as idle");
         assert_eq!(&buf, b"tick");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// The concurrency caps above govern *admitted* chains. They are taken only
+/// after the mTLS accept and the first frame read have both succeeded, so on
+/// their own they leave the handshake window itself unbounded: a peer could
+/// open connections without limit and hold each one for `handshake_timeout_ms`
+/// at no accounting cost.
+///
+/// Bounding that window is awkward on purpose. Before the TLS handshake
+/// completes there is no authenticated identity to key an allowance on —
+/// the identity is precisely what the handshake produces, and refusing to
+/// pay for the handshake means refusing to learn it. The source address is
+/// the only handle available, so that is what the pre-admission caps use,
+/// with a global ceiling behind it.
+#[tokio::test]
+async fn refuses_a_connection_beyond_the_pre_admission_cap() {
+    let ca = TestCa::new();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.max_pending_per_addr = 1;
+    let runtime = radii_fetch::relay::RelayRuntime::new(config, echo_addr.clone(), None).unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+    // `wait_ready` probes by connecting and closing, and that probe itself
+    // occupies a pre-admission slot until its handshake fails. With a cap of
+    // one, assert only after it has drained.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Occupy the single pre-admission slot: connect, then never send a
+    // ClientHello, so the relay sits in its TLS accept.
+    let _stalled = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // A second connection from the same address must be dropped before the
+    // relay spends a handshake on it. It gets a plain TCP close: sending a
+    // Radii status would itself require completing the handshake we are
+    // declining to pay for.
+    let mut refused = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), refused.read(&mut buf))
+        .await
+        .expect("relay should close a beyond-cap connection promptly, not hold it");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "expected the second pre-admission connection to be closed, got {read:?}"
+    );
+}
+
+/// The global pre-admission ceiling, independent of source address.
+#[tokio::test]
+async fn refuses_a_connection_beyond_the_global_pre_admission_cap() {
+    let ca = TestCa::new();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    config.max_pending_total = 1;
+    config.max_pending_per_addr = 64; // so the per-address cap cannot be what trips
+    let runtime = radii_fetch::relay::RelayRuntime::new(config, echo_addr.clone(), None).unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+    // See the note in the per-address test: `wait_ready`'s probe holds a
+    // pre-admission slot until its handshake fails, which matters when the
+    // ceiling is one.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let _stalled = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let mut refused = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), refused.read(&mut buf))
+        .await
+        .expect("relay should close a beyond-ceiling connection promptly");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "expected the second connection to be closed, got {read:?}"
+    );
+}
+
+/// A pre-admission slot must be released once its connection is admitted, or
+/// the relay locks itself out after `max_pending_total` successful chains.
+#[tokio::test]
+async fn releases_a_pre_admission_slot_once_a_chain_is_admitted() {
+    let ca = TestCa::new();
+    let peer = TlsIdentity::load(&ca.issue("node-s")).unwrap();
+
+    let (echo_listener, echo_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_echo(echo_listener));
+
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let mut config = relay_config(&ca, "node-t", &relay_addr);
+    // One pre-admission slot, but several admitted chains allowed. Each
+    // chain must hand its slot back on admission, or the second attempt
+    // never gets a handshake.
+    config.max_pending_total = 1;
+    config.max_pending_per_addr = 1;
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        config,
+        echo_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-t")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+    wait_ready(&relay_addr).await.unwrap();
+
+    let route = route_to(&relay_addr);
+    let mut held = Vec::new();
+    for attempt in 0..3 {
+        let mut stream = radii_fetch::chain::establish(&route, Some(&peer), Some(&peer))
+            .await
+            .unwrap_or_else(|err| {
+                panic!("attempt {attempt} refused — a pre-admission slot leaked: {err}")
+            });
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        // Keep the chain open: it holds a chain permit, but must no longer
+        // hold a pre-admission slot.
+        held.push(stream);
     }
 }

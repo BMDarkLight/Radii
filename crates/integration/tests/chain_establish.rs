@@ -34,6 +34,8 @@ fn relay_config(ca: &TestCa, node_id: &str, bind: &str) -> radii_fetch::config::
         max_concurrent_per_peer: 4,
         idle_timeout_ms: 30_000,
         handshake_timeout_ms: 10_000,
+        max_pending_total: 256,
+        max_pending_per_addr: 16,
         allow_peers: Vec::new(),
         tls: Some(ca.issue(node_id)),
     }

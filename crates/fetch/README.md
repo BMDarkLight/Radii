@@ -78,3 +78,25 @@ Any node that can appear in a resolved route — **including as a route's
 target** — must run `[relay]` and advertise *that listener's* address in its
 `listen_addrs`. See the source-routing section of [`SECURITY.md`](../../SECURITY.md)
 for why, and for what breaks if it advertises a plain tunnel port instead.
+
+### Two allowances, and why they cannot be one
+
+Relay resources are rationed in two separate stages:
+
+- `max_concurrent_total` / `max_concurrent_per_peer` bound **admitted chains**,
+  keyed by the authenticated peer id.
+- `max_pending_total` / `max_pending_per_addr` bound connections still in the
+  **handshake window**, keyed by source address.
+
+They cannot be merged, because the authenticated identity is precisely what
+the handshake produces. Refusing to spend a handshake means refusing to learn
+who is asking, so a pre-admission allowance has nothing to key on but the
+source address — blunt where peers share a NAT, which is why it is set well
+above a legitimate peer's concurrent-chain allowance rather than tuned tightly.
+
+A connection turned away pre-admission gets a plain TCP close rather than a
+Radii status, for the same reason: sending it a status would require
+completing the handshake being declined.
+
+A pre-admission slot is released the moment a chain is admitted, so a
+long-lived tunnel occupies a chain slot but not a handshake slot.

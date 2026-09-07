@@ -51,6 +51,22 @@ pub struct RelayConfig {
     pub max_concurrent_total: usize,
     #[serde(default = "default_max_concurrent_per_peer")]
     pub max_concurrent_per_peer: usize,
+    /// Ceiling on connections still in the pre-admission window — accepted,
+    /// but not yet through the mTLS handshake and first frame.
+    ///
+    /// `max_concurrent_*` cannot cover this window: those are keyed by the
+    /// authenticated peer id, and that id is what the handshake produces.
+    /// Declining to pay for a handshake means declining to learn who is
+    /// asking, so the only handle left is the source address, backed by this
+    /// global ceiling.
+    #[serde(default = "default_max_pending_total")]
+    pub max_pending_total: usize,
+    /// Per-source-address share of [`Self::max_pending_total`]. Blunt by
+    /// necessity — peers behind one NAT share an address — so it is set
+    /// well above a legitimate peer's concurrent-chain allowance rather
+    /// than tuned tightly.
+    #[serde(default = "default_max_pending_per_addr")]
+    pub max_pending_per_addr: usize,
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
     /// Bounds the entire pre-splice handshake window — from the inbound
@@ -78,6 +94,14 @@ fn default_max_concurrent_total() -> usize {
 
 fn default_max_concurrent_per_peer() -> usize {
     8
+}
+
+fn default_max_pending_total() -> usize {
+    256
+}
+
+fn default_max_pending_per_addr() -> usize {
+    16
 }
 
 fn default_idle_timeout_ms() -> u64 {
