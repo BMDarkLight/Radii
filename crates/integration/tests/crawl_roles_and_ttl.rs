@@ -1,6 +1,6 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_integration::{bind_local, wait_ready};
-use radii_proto::{query_graph, read_message, write_message, RadiiMessage};
+use radii_proto::{query_graph, read_message, write_message, ListenAddr, RadiiMessage};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -19,7 +19,10 @@ async fn graph_query_reflects_declared_roles() {
         &RadiiMessage::NodeHello {
             node_id: "wave-a".into(),
             roles: vec!["wave".into()],
-            listen_addrs: vec!["127.0.0.1:9500".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:9500".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await
@@ -52,7 +55,10 @@ async fn graph_query_drops_nodes_past_their_ttl() {
         &RadiiMessage::NodeHello {
             node_id: "wave-a".into(),
             roles: vec!["wave".into()],
-            listen_addrs: vec!["127.0.0.1:9500".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:9500".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await

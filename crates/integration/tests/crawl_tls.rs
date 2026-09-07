@@ -2,7 +2,7 @@ use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_integration::pki::TestCa;
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::tls::TlsIdentity;
-use radii_proto::{read_message, write_message, RadiiMessage};
+use radii_proto::{read_message, write_message, ListenAddr, RadiiMessage};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -35,7 +35,10 @@ async fn tls_enabled_crawl_authorizes_by_peer_identity() {
         &RadiiMessage::NodeHello {
             node_id: "node-b".into(),
             roles: vec![],
-            listen_addrs: vec!["10.0.0.1:1".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "10.0.0.1:1".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await
@@ -52,7 +55,10 @@ async fn tls_enabled_crawl_authorizes_by_peer_identity() {
         &RadiiMessage::NodeHello {
             node_id: "node-a".into(),
             roles: vec![],
-            listen_addrs: vec!["10.0.0.2:2".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "10.0.0.2:2".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await

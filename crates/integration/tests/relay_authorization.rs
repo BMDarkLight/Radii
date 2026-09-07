@@ -11,7 +11,7 @@ use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_integration::pki::TestCa;
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::tls::TlsIdentity;
-use radii_proto::{read_message, write_message, RadiiMessage, RelayedMessage};
+use radii_proto::{read_message, write_message, ListenAddr, RadiiMessage, RelayedMessage};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,7 +24,10 @@ fn spoofed_hello() -> RelayedMessage {
     RelayedMessage::NodeHello {
         node_id: "victim-node".into(),
         roles: vec!["resource".into()],
-        listen_addrs: vec!["6.6.6.6:9000".into()],
+        listen_addrs: vec![ListenAddr {
+            addr: "6.6.6.6:9000".into(),
+            role: "relay".into(),
+        }],
     }
 }
 
@@ -67,7 +70,10 @@ async fn from_head_no_longer_bypasses_the_identity_check() {
         &RadiiMessage::NodeHello {
             node_id: "victim-node".into(),
             roles: vec![],
-            listen_addrs: vec!["6.6.6.6:9000".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "6.6.6.6:9000".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await
@@ -168,7 +174,10 @@ async fn configured_relay_forwards_a_matching_claim() {
             message: RelayedMessage::NodeHello {
                 node_id: "node-b".into(),
                 roles: vec!["resource".into()],
-                listen_addrs: vec!["10.0.0.5:9000".into()],
+                listen_addrs: vec![ListenAddr {
+                    addr: "10.0.0.5:9000".into(),
+                    role: "relay".into(),
+                }],
             },
         },
     )
@@ -181,7 +190,13 @@ async fn configured_relay_forwards_a_matching_claim() {
 
     let guard = state.read().await;
     let entry = guard.nodes.get("node-b").expect("relayed hello ingested");
-    assert_eq!(entry.listen_addrs, vec!["10.0.0.5:9000".to_string()]);
+    assert_eq!(
+        entry.listen_addrs,
+        vec![ListenAddr {
+            addr: "10.0.0.5:9000".to_string(),
+            role: "relay".to_string(),
+        }]
+    );
     drop(guard);
     handle.abort();
 }

@@ -17,6 +17,18 @@ pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 /// wire layer must bound its own input without reaching for domain types.
 pub const MAX_TUNNEL_HOPS: usize = 32;
 
+/// Maximum advertised listen addresses per node.
+///
+/// `listen_addrs` is peer-supplied and was previously unbounded: a hostile
+/// `NodeHello` could carry as many addresses as fit in [`MAX_FRAME_LEN`],
+/// and Crawl stored every one of them, per node. Bounded here rather than
+/// at a call site so the limit applies to anything arriving on the wire.
+pub const MAX_LISTEN_ADDRS: usize = 16;
+/// Maximum length of one advertised address string.
+pub const MAX_LISTEN_ADDR_LEN: usize = 256;
+/// Maximum length of one address role string.
+pub const MAX_ROLE_LEN: usize = 64;
+
 /// A connected transport, plaintext or TLS — boxing behind this trait lets
 /// connection-handling code stay transport-agnostic once the (optional) TLS
 /// handshake is done, since [`read_message`]/[`write_message`] only need
@@ -35,12 +47,34 @@ pub struct RouteHop {
     pub addr: String,
 }
 
+/// One advertised listener, and what it speaks.
+///
+/// The role is what stops a single registry entry meaning two incompatible
+/// things: Fetch reaches a node over its `relay` listener, while Head hands
+/// a caller the node's `http` address to dial directly. Without the tag,
+/// one consumer inevitably reads the other's address.
+///
+/// Flat by construction, like `RouteHop` and `RelayedMessage`: a
+/// listen-address list can never nest, so a hostile frame cannot drive the
+/// decoder into recursion.
+///
+/// `role` is a free string rather than an enum on purpose. Nodes in a mesh
+/// upgrade at different times, and a consumer should ignore a role it does
+/// not recognise rather than fail the whole `NodeHello`; an enum would make
+/// every future role a flag day. Known roles are named by
+/// `radii_core::routing::RoleId`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListenAddr {
+    pub addr: String,
+    pub role: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RadiiMessage {
     NodeHello {
         node_id: String,
         roles: Vec<String>,
-        listen_addrs: Vec<String>,
+        listen_addrs: Vec<ListenAddr>,
     },
     ReachabilityProbe {
         from: String,
@@ -101,7 +135,7 @@ pub enum RelayedMessage {
     NodeHello {
         node_id: String,
         roles: Vec<String>,
-        listen_addrs: Vec<String>,
+        listen_addrs: Vec<ListenAddr>,
     },
     ReachabilityProbe {
         from: String,
@@ -177,7 +211,7 @@ impl TryFrom<RadiiMessage> for RelayedMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeInfo {
     pub node_id: String,
-    pub listen_addrs: Vec<String>,
+    pub listen_addrs: Vec<ListenAddr>,
     pub roles: Vec<String>,
 }
 
@@ -235,7 +269,7 @@ pub async fn send_hello<A: ToSocketAddrs>(
     addr: A,
     node_id: String,
     roles: Vec<String>,
-    listen_addrs: Vec<String>,
+    listen_addrs: Vec<ListenAddr>,
 ) -> Result<RadiiMessage> {
     let mut stream = TcpStream::connect(addr).await?;
     send_hello_on(&mut stream, node_id, roles, listen_addrs).await
@@ -247,7 +281,7 @@ pub async fn send_hello_on<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     node_id: String,
     roles: Vec<String>,
-    listen_addrs: Vec<String>,
+    listen_addrs: Vec<ListenAddr>,
 ) -> Result<RadiiMessage> {
     write_message(
         stream,
@@ -333,6 +367,29 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
         }
     }
 
+    if let RadiiMessage::NodeHello { listen_addrs, .. } = &message {
+        if listen_addrs.len() > MAX_LISTEN_ADDRS {
+            bail!(
+                "node_hello listen_addrs count {} exceeds {MAX_LISTEN_ADDRS}",
+                listen_addrs.len()
+            );
+        }
+        for entry in listen_addrs {
+            if entry.addr.len() > MAX_LISTEN_ADDR_LEN {
+                bail!(
+                    "node_hello listen address length {} exceeds {MAX_LISTEN_ADDR_LEN}",
+                    entry.addr.len()
+                );
+            }
+            if entry.role.len() > MAX_ROLE_LEN {
+                bail!(
+                    "node_hello listen address role length {} exceeds {MAX_ROLE_LEN}",
+                    entry.role.len()
+                );
+            }
+        }
+    }
+
     Ok(message)
 }
 
@@ -352,7 +409,10 @@ mod tests {
         let original = RadiiMessage::NodeHello {
             node_id: "node-a".into(),
             roles: vec!["crawl".into()],
-            listen_addrs: vec!["127.0.0.1:7100".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:7100".into(),
+                role: "relay".into(),
+            }],
         };
         assert_eq!(round_trip(original.clone()).await, original);
     }
@@ -445,7 +505,10 @@ mod tests {
         let snapshot = RadiiMessage::GraphSnapshot {
             nodes: vec![NodeInfo {
                 node_id: "node-a".into(),
-                listen_addrs: vec!["127.0.0.1:9000".into()],
+                listen_addrs: vec![ListenAddr {
+                    addr: "127.0.0.1:9000".into(),
+                    role: "relay".into(),
+                }],
                 roles: vec!["crawl".into()],
             }],
             reports: vec![GraphReport {
@@ -503,7 +566,10 @@ mod tests {
                 RadiiMessage::NodeHello {
                     node_id: "node-a".into(),
                     roles: vec!["wave".into()],
-                    listen_addrs: vec!["127.0.0.1:1".into()],
+                    listen_addrs: vec![ListenAddr {
+                        addr: "127.0.0.1:1".into(),
+                        role: "relay".into(),
+                    }],
                 }
             );
             write_message(
@@ -520,7 +586,10 @@ mod tests {
             &mut client,
             "node-a".into(),
             vec!["wave".into()],
-            vec!["127.0.0.1:1".into()],
+            vec![ListenAddr {
+                addr: "127.0.0.1:1".into(),
+                role: "relay".into(),
+            }],
         )
         .await
         .unwrap();
@@ -633,5 +702,93 @@ mod tests {
 
         let err = read_message(&mut buf.as_slice()).await.unwrap_err();
         assert!(err.to_string().contains("hop count"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn node_hello_round_trips_role_tagged_addresses() {
+        let message = RadiiMessage::NodeHello {
+            node_id: "node-b".into(),
+            roles: vec!["resource".into()],
+            listen_addrs: vec![
+                ListenAddr {
+                    addr: "10.0.0.5:2224".into(),
+                    role: "relay".into(),
+                },
+                ListenAddr {
+                    addr: "10.0.0.5:9000".into(),
+                    role: "http".into(),
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &message).await.unwrap();
+        assert_eq!(read_message(&mut buf.as_slice()).await.unwrap(), message);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hello_with_too_many_listen_addrs() {
+        let listen_addrs = (0..=MAX_LISTEN_ADDRS)
+            .map(|i| ListenAddr {
+                addr: format!("10.0.0.1:{i}"),
+                role: "relay".into(),
+            })
+            .collect();
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &RadiiMessage::NodeHello {
+                node_id: "n".into(),
+                roles: vec![],
+                listen_addrs,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("listen_addrs"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hello_with_an_oversized_address() {
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &RadiiMessage::NodeHello {
+                node_id: "n".into(),
+                roles: vec![],
+                listen_addrs: vec![ListenAddr {
+                    addr: "a".repeat(MAX_LISTEN_ADDR_LEN + 1),
+                    role: "relay".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("address"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hello_with_an_oversized_role() {
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &RadiiMessage::NodeHello {
+                node_id: "n".into(),
+                roles: vec![],
+                listen_addrs: vec![ListenAddr {
+                    addr: "10.0.0.1:1".into(),
+                    role: "r".repeat(MAX_ROLE_LEN + 1),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_message(&mut buf.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("role"), "got: {err}");
     }
 }

@@ -1,6 +1,6 @@
 use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_integration::{bind_local, wait_ready};
-use radii_proto::{read_message, write_message, RadiiMessage, RelayedMessage};
+use radii_proto::{read_message, write_message, ListenAddr, RadiiMessage, RelayedMessage};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -20,7 +20,10 @@ async fn hello_probe_and_report_are_acked_and_stored() {
         &RadiiMessage::NodeHello {
             node_id: "node-a".into(),
             roles: vec!["crawl".into()],
-            listen_addrs: vec!["127.0.0.1:1".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:1".into(),
+                role: "relay".into(),
+            }],
         },
     )
     .await
@@ -67,7 +70,10 @@ async fn hello_probe_and_report_are_acked_and_stored() {
         let guard = state.read().await;
         assert_eq!(
             guard.nodes.get("node-a").unwrap().listen_addrs,
-            vec!["127.0.0.1:1".to_string()]
+            vec![ListenAddr {
+                addr: "127.0.0.1:1".to_string(),
+                role: "relay".to_string(),
+            }]
         );
         assert_eq!(guard.reachability.len(), 1);
     }

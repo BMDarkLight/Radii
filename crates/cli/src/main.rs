@@ -149,6 +149,15 @@ async fn send_hello(
 ) -> Result<()> {
     let tls = tls.load()?;
     let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
+    // TASK 3: --listen-addrs and this empty role are a placeholder, not a
+    // decision — replaced by a role-carrying `--listen-addr role=addr` flag.
+    let listen_addrs = listen_addrs
+        .into_iter()
+        .map(|addr| radii_proto::ListenAddr {
+            addr,
+            role: String::new(),
+        })
+        .collect();
     let reply = radii_proto::send_hello_on(&mut stream, node_id, roles, listen_addrs).await?;
     print_reply(reply);
     Ok(())

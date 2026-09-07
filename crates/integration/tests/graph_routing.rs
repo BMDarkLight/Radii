@@ -3,7 +3,7 @@ use radii_head::decision::{DecisionEngine, GraphRoutePolicy};
 use radii_head::graph::{self, GraphState};
 use radii_head::http::serve_http_on;
 use radii_integration::{bind_local, wait_ready};
-use radii_proto::{write_message, RadiiMessage};
+use radii_proto::{write_message, ListenAddr, RadiiMessage};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpStream;
@@ -30,7 +30,10 @@ async fn head_resolves_backend_from_crawl_graph() {
         &RadiiMessage::NodeHello {
             node_id: "node-b".into(),
             roles: vec!["resource".into()],
-            listen_addrs: vec!["10.0.0.5:9000".into()],
+            listen_addrs: vec![ListenAddr {
+                addr: "10.0.0.5:9000".into(),
+                role: "http".into(),
+            }],
         },
     )
     .await

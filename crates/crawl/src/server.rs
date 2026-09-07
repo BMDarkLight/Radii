@@ -1,6 +1,7 @@
 use radii_proto::tls::TlsIdentity;
 use radii_proto::{
-    read_message, write_message, BoxedStream, GraphReport, NodeInfo, RadiiMessage, RelayedMessage,
+    read_message, write_message, BoxedStream, GraphReport, ListenAddr, NodeInfo, RadiiMessage,
+    RelayedMessage,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -19,7 +20,7 @@ pub const MAX_REACHABILITY_ENTRIES_PER_PEER: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct NodeEntry {
-    pub listen_addrs: Vec<String>,
+    pub listen_addrs: Vec<ListenAddr>,
     pub roles: Vec<String>,
     pub last_seen_unix_ms: u64,
 }
@@ -584,7 +585,10 @@ mod tests {
 
     fn entry(roles: Vec<&str>, last_seen_unix_ms: u64) -> NodeEntry {
         NodeEntry {
-            listen_addrs: vec!["127.0.0.1:1".to_string()],
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:1".to_string(),
+                role: "relay".to_string(),
+            }],
             roles: roles.into_iter().map(String::from).collect(),
             last_seen_unix_ms,
         }

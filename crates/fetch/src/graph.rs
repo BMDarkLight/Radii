@@ -114,9 +114,19 @@ async fn fetch_once(
             "crawl graph exceeded the local size cap; planning from a partial view"
         );
     }
-    let listen_addrs = nodes
+    // Discards the role for now: resolution still takes the first address
+    // regardless of what it advertises. A later task makes this role-aware.
+    let listen_addrs: HashMap<String, Vec<String>> = nodes
         .into_iter()
-        .map(|node| (node.node_id, node.listen_addrs))
+        .map(|node| {
+            (
+                node.node_id,
+                node.listen_addrs
+                    .into_iter()
+                    .map(|entry| entry.addr)
+                    .collect(),
+            )
+        })
         .collect();
     Ok((snapshot, listen_addrs))
 }

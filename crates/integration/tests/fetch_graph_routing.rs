@@ -4,7 +4,7 @@ use radii_fetch::server::run_on_dynamic_with_tls;
 use radii_integration::pki::TestCa;
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::tls::TlsIdentity;
-use radii_proto::{read_message, write_message, RadiiMessage};
+use radii_proto::{read_message, write_message, ListenAddr, RadiiMessage};
 use std::io::Write;
 use std::sync::{Arc, RwLock};
 use tempfile::NamedTempFile;
@@ -89,7 +89,10 @@ async fn fetch_tunnels_to_graph_resolved_upstream() {
         &RadiiMessage::NodeHello {
             node_id: "node-b".into(),
             roles: vec!["resource".into()],
-            listen_addrs: vec![b_addr.clone()],
+            listen_addrs: vec![ListenAddr {
+                addr: b_addr.clone(),
+                role: "relay".into(),
+            }],
         },
     )
     .await
