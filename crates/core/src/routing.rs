@@ -31,6 +31,26 @@ impl ProtocolId {
     }
 }
 
+/// What an advertised address speaks.
+///
+/// A free string with named constants, like [`ProtocolId`], so an unknown
+/// role is something a consumer ignores rather than something that fails a
+/// whole `NodeHello`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoleId(pub String);
+
+impl RoleId {
+    /// A relay listener: mutual TLS plus a `TunnelOpen` preamble. What Fetch
+    /// reaches a node over, including as a chain's final hop.
+    pub const RELAY: &'static str = "relay";
+    /// A plain HTTP backend, dialed directly. What Head hands its callers.
+    pub const HTTP: &'static str = "http";
+
+    pub fn new<S: Into<String>>(value: S) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Link {
     pub from: NodeId,
@@ -175,12 +195,14 @@ impl ResolvedRoute {
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_candidates(
     snapshot: &GraphSnapshot,
-    listen_addrs: &HashMap<String, Vec<String>>,
+    listen_addrs: &HashMap<String, Vec<(String, String)>>,
     source: &NodeId,
     targets: &[NodeId],
     allowed_protocols: &[ProtocolId],
     max_hops: usize,
     limit: usize,
+    hop_role: Option<&RoleId>,
+    target_role: &RoleId,
 ) -> Vec<ResolvedRoute> {
     let planner = RoutePlanner::new(DefaultScorer);
     let mut resolved: Vec<ResolvedRoute> = Vec::new();
@@ -195,13 +217,27 @@ pub fn resolve_candidates(
 
         for candidate in planner.plan(snapshot, &request, limit) {
             // `candidate.hops` starts at the source; skip it.
-            let mut hops = Vec::with_capacity(candidate.hops.len().saturating_sub(1));
+            let mut hops = Vec::new();
             let mut dialable = true;
-            for node in candidate.hops.iter().skip(1) {
-                match listen_addrs.get(&node.0).and_then(|addrs| addrs.first()) {
+            let last_index = candidate.hops.len() - 1;
+
+            for (index, node) in candidate.hops.iter().enumerate().skip(1) {
+                let is_target = index == last_index;
+                // Intermediates are resolved only when the caller will dial
+                // them. Head does not — it hands its caller the target's
+                // address and the caller dials that directly — so an
+                // intermediate it never touches must not disqualify a route.
+                let role = if is_target {
+                    Some(target_role)
+                } else {
+                    hop_role
+                };
+                let Some(role) = role else { continue };
+
+                match addr_for_role(listen_addrs, node, role) {
                     Some(addr) => hops.push(ResolvedHop {
                         node_id: node.clone(),
-                        addr: addr.clone(),
+                        addr,
                     }),
                     None => {
                         dialable = false;
@@ -226,6 +262,19 @@ pub fn resolve_candidates(
     resolved.retain(|route| seen.insert(route.node_sequence()));
     resolved.truncate(limit);
     resolved
+}
+
+/// The first address `node` advertises in `role`, if any.
+fn addr_for_role(
+    listen_addrs: &HashMap<String, Vec<(String, String)>>,
+    node: &NodeId,
+    role: &RoleId,
+) -> Option<String> {
+    listen_addrs
+        .get(&node.0)?
+        .iter()
+        .find(|(_, advertised)| advertised == &role.0)
+        .map(|(addr, _)| addr.clone())
 }
 
 /// Cost model for traversing a single link.
@@ -575,11 +624,26 @@ mod tests {
         }
     }
 
-    fn addrs(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+    fn addrs(pairs: &[(&str, &str)]) -> HashMap<String, Vec<(String, String)>> {
         pairs
             .iter()
-            .map(|(node, addr)| ((*node).to_string(), vec![(*addr).to_string()]))
+            .map(|(node, addr)| {
+                (
+                    (*node).to_string(),
+                    vec![((*addr).to_string(), "relay".to_string())],
+                )
+            })
             .collect()
+    }
+
+    fn tagged(pairs: &[(&str, &str, &str)]) -> HashMap<String, Vec<(String, String)>> {
+        let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (node, addr, role) in pairs {
+            map.entry((*node).to_string())
+                .or_default()
+                .push(((*addr).to_string(), (*role).to_string()));
+        }
+        map
     }
 
     #[test]
@@ -802,6 +866,8 @@ mod tests {
             &[ProtocolId::new("radii")],
             4,
             5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
         );
 
         assert_eq!(routes.len(), 2);
@@ -828,6 +894,8 @@ mod tests {
             &[ProtocolId::new("radii")],
             4,
             5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
         );
 
         assert_eq!(routes.len(), 1);
@@ -861,6 +929,8 @@ mod tests {
             &[ProtocolId::new("radii")],
             4,
             5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
         );
 
         assert!(routes.is_empty());
@@ -889,6 +959,8 @@ mod tests {
             &[ProtocolId::new("radii")],
             4,
             1,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
         );
 
         assert_eq!(routes.len(), 1, "limit must truncate after dedupe");
@@ -908,8 +980,120 @@ mod tests {
             &[ProtocolId::new("radii")],
             4,
             5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
         );
 
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn resolves_only_addresses_matching_the_required_role() {
+        let snapshot = GraphSnapshot::from_reports([report("s", "t", "radii", 10)]);
+        let listen = tagged(&[
+            ("t", "10.0.0.5:9000", "http"),
+            ("t", "10.0.0.5:2224", "relay"),
+        ]);
+
+        let relay = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
+        );
+        assert_eq!(relay[0].hops[0].addr, "10.0.0.5:2224");
+
+        let http = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+            None,
+            &RoleId::new(RoleId::HTTP),
+        );
+        assert_eq!(http[0].hops[0].addr, "10.0.0.5:9000");
+    }
+
+    #[test]
+    fn drops_a_route_whose_target_lacks_the_required_role() {
+        let snapshot = GraphSnapshot::from_reports([report("s", "t", "radii", 10)]);
+        let listen = tagged(&[("t", "10.0.0.5:9000", "http")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
+        );
+        assert!(
+            routes.is_empty(),
+            "a node with no relay address is not a relay target"
+        );
+    }
+
+    #[test]
+    fn drops_a_route_whose_intermediate_lacks_the_required_role() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "r", "radii", 10),
+            report("r", "t", "radii", 10),
+        ]);
+        // `r` serves http only, so it cannot carry a relayed chain.
+        let listen = tagged(&[
+            ("r", "10.0.0.9:9000", "http"),
+            ("t", "10.0.0.5:2224", "relay"),
+        ]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+            Some(&RoleId::new(RoleId::RELAY)),
+            &RoleId::new(RoleId::RELAY),
+        );
+        assert!(routes.is_empty());
+    }
+
+    /// With `hop_role: None` the caller dials nothing in between, so an
+    /// intermediate with no usable address must not disqualify the route — only
+    /// the target's role matters.
+    #[test]
+    fn ignores_intermediate_roles_when_hop_role_is_none() {
+        let snapshot = GraphSnapshot::from_reports([
+            report("s", "r", "radii", 10),
+            report("r", "t", "radii", 10),
+        ]);
+        let listen = tagged(&[("t", "10.0.0.5:9000", "http")]);
+
+        let routes = resolve_candidates(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+            None,
+            &RoleId::new(RoleId::HTTP),
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].hops.len(), 1, "only the target is resolved");
+        assert_eq!(routes[0].hops[0].addr, "10.0.0.5:9000");
     }
 }

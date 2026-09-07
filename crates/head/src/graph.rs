@@ -1,5 +1,5 @@
 use crate::config::GraphConfig;
-use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
+use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId, RoleId};
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,7 +10,7 @@ use std::time::Duration;
 #[derive(Default)]
 pub struct GraphState {
     pub snapshot: GraphSnapshot,
-    pub listen_addrs: HashMap<String, Vec<String>>,
+    pub listen_addrs: HashMap<String, Vec<(String, String)>>,
 }
 
 pub type SharedGraphState = Arc<RwLock<GraphState>>;
@@ -44,7 +44,7 @@ pub async fn run_poll(
 async fn fetch_once(
     crawl_upstream: &str,
     tls: Option<&TlsIdentity>,
-) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<String>>)> {
+) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<(String, String)>>)> {
     let mut stream = radii_proto::tls::dial(crawl_upstream, tls).await?;
     let (nodes, reports) = radii_proto::query_graph_on(&mut stream).await?;
 
@@ -65,16 +65,14 @@ async fn fetch_once(
             "crawl graph exceeded the local size cap; routing from a partial view"
         );
     }
-    // Discards the role for now: resolution still takes the first address
-    // regardless of what it advertises. A later task makes this role-aware.
-    let listen_addrs: HashMap<String, Vec<String>> = nodes
+    let listen_addrs: HashMap<String, Vec<(String, String)>> = nodes
         .into_iter()
         .map(|node| {
             (
                 node.node_id,
                 node.listen_addrs
                     .into_iter()
-                    .map(|entry| entry.addr)
+                    .map(|entry| (entry.addr, entry.role))
                     .collect(),
             )
         })
@@ -100,6 +98,8 @@ pub fn plan_backend(
         allowed_protocols,
         max_hops,
         1,
+        None,
+        &RoleId::new(RoleId::HTTP),
     )
     .into_iter()
     .next()?;
@@ -111,16 +111,11 @@ pub fn plan_backend(
 
 /// All reachable backends for `targets`, best first.
 ///
-/// NOTE ON WHAT AN ADDRESS MEANS HERE. Head returns these to a caller that
-/// will dial them as ordinary backends. Fetch reads the *same* node registry
-/// and now treats an entry as a relay listener — one that requires mutual
-/// TLS and a `TunnelOpen` preamble before it will carry anything. One
-/// registry field therefore has two incompatible readings, and Head assumes
-/// the plain-backend one. A node advertising a relay listener will be handed
-/// to Head's callers as though it were an HTTP backend, and the failure will
-/// look like a backend outage. Resolving this needs either separate address
-/// roles per node or a role tag in the registry; both are protocol changes
-/// beyond this function. See `SECURITY.md`'s residual-risk table.
+/// Head resolves the target's `http` address — the endpoint its caller will
+/// dial directly — and passes `None` for the hop role because it dials no
+/// intermediate. Fetch resolves `relay` addresses instead, for every hop.
+/// The role tag is what lets one registry entry serve both without either
+/// consumer reading the other's address.
 pub fn plan_backends(
     state: &SharedGraphState,
     source: &NodeId,
@@ -140,6 +135,8 @@ pub fn plan_backends(
         allowed_protocols,
         max_hops,
         limit,
+        None,
+        &RoleId::new(RoleId::HTTP),
     )
     .into_iter()
     .map(|route| {
@@ -172,7 +169,10 @@ mod tests {
             });
         }
         let mut listen_addrs = HashMap::new();
-        listen_addrs.insert("node-b".to_string(), vec!["10.0.0.5:9000".to_string()]);
+        listen_addrs.insert(
+            "node-b".to_string(),
+            vec![("10.0.0.5:9000".to_string(), "http".to_string())],
+        );
         Arc::new(RwLock::new(GraphState {
             snapshot,
             listen_addrs,

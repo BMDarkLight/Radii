@@ -1,6 +1,6 @@
 use crate::config::GraphConfig;
 use radii_core::routing::{
-    resolve_candidates, GraphSnapshot, Link, NodeId, ProtocolId, ResolvedRoute,
+    resolve_candidates, GraphSnapshot, Link, NodeId, ProtocolId, ResolvedRoute, RoleId,
 };
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ pub type SharedRoutes = Arc<RwLock<Vec<ResolvedRoute>>>;
 #[allow(clippy::too_many_arguments)]
 pub fn plan_from(
     snapshot: &GraphSnapshot,
-    listen_addrs: &HashMap<String, Vec<String>>,
+    listen_addrs: &HashMap<String, Vec<(String, String)>>,
     source: &NodeId,
     targets: &[NodeId],
     allowed_protocols: &[ProtocolId],
@@ -32,6 +32,8 @@ pub fn plan_from(
         allowed_protocols,
         max_hops,
         max_candidates,
+        Some(&RoleId::new(RoleId::RELAY)),
+        &RoleId::new(RoleId::RELAY),
     )
 }
 
@@ -93,7 +95,7 @@ pub async fn run_poll(
 async fn fetch_once(
     crawl_upstream: &str,
     tls: Option<&TlsIdentity>,
-) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<String>>)> {
+) -> anyhow::Result<(GraphSnapshot, HashMap<String, Vec<(String, String)>>)> {
     let mut stream = radii_proto::tls::dial(crawl_upstream, tls).await?;
     let (nodes, reports) = radii_proto::query_graph_on(&mut stream).await?;
 
@@ -114,16 +116,14 @@ async fn fetch_once(
             "crawl graph exceeded the local size cap; planning from a partial view"
         );
     }
-    // Discards the role for now: resolution still takes the first address
-    // regardless of what it advertises. A later task makes this role-aware.
-    let listen_addrs: HashMap<String, Vec<String>> = nodes
+    let listen_addrs: HashMap<String, Vec<(String, String)>> = nodes
         .into_iter()
         .map(|node| {
             (
                 node.node_id,
                 node.listen_addrs
                     .into_iter()
-                    .map(|entry| entry.addr)
+                    .map(|entry| (entry.addr, entry.role))
                     .collect(),
             )
         })
@@ -148,9 +148,15 @@ mod tests {
                 latency_ms: Some(rtt),
             });
         }
-        let listen: HashMap<String, Vec<String>> = [
-            ("t1".to_string(), vec!["10.0.0.1:2224".to_string()]),
-            ("t2".to_string(), vec!["10.0.0.2:2224".to_string()]),
+        let listen: HashMap<String, Vec<(String, String)>> = [
+            (
+                "t1".to_string(),
+                vec![("10.0.0.1:2224".to_string(), "relay".to_string())],
+            ),
+            (
+                "t2".to_string(),
+                vec![("10.0.0.2:2224".to_string(), "relay".to_string())],
+            ),
         ]
         .into_iter()
         .collect();
@@ -167,5 +173,42 @@ mod tests {
 
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].target().0, "t2", "cheaper target ranks first");
+    }
+
+    #[test]
+    fn plans_only_to_targets_advertising_a_relay_address() {
+        let mut snapshot = GraphSnapshot::new();
+        for to in ["t-relay", "t-http"] {
+            snapshot.add_link(Link {
+                from: NodeId("s".into()),
+                to: NodeId(to.into()),
+                protocol: ProtocolId::new("radii"),
+                reachable: true,
+                latency_ms: Some(10),
+            });
+        }
+        let mut listen: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        listen.insert(
+            "t-relay".into(),
+            vec![("10.0.0.1:2224".into(), "relay".into())],
+        );
+        // Advertises only an http backend, so it is not a relay target.
+        listen.insert(
+            "t-http".into(),
+            vec![("10.0.0.2:9000".into(), "http".into())],
+        );
+
+        let routes = plan_from(
+            &snapshot,
+            &listen,
+            &NodeId("s".into()),
+            &[NodeId("t-relay".into()), NodeId("t-http".into())],
+            &[ProtocolId::new("radii")],
+            4,
+            5,
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].target().0, "t-relay");
     }
 }

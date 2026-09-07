@@ -72,8 +72,14 @@ async fn head_reports_ranked_candidates() {
         });
     }
     let mut listen_addrs = HashMap::new();
-    listen_addrs.insert("node-b".to_string(), vec!["10.0.0.11:9000".to_string()]);
-    listen_addrs.insert("node-c".to_string(), vec!["10.0.0.12:9000".to_string()]);
+    listen_addrs.insert(
+        "node-b".to_string(),
+        vec![("10.0.0.11:9000".to_string(), "http".to_string())],
+    );
+    listen_addrs.insert(
+        "node-c".to_string(),
+        vec![("10.0.0.12:9000".to_string(), "http".to_string())],
+    );
     let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
         snapshot,
         listen_addrs,

@@ -56,8 +56,8 @@ enum Commands {
         node_id: String,
         #[arg(long, value_delimiter = ',')]
         roles: Vec<String>,
-        #[arg(long, value_delimiter = ',')]
-        listen_addrs: Vec<String>,
+        #[arg(long = "listen-addr", value_parser = parse_listen_addr)]
+        listen_addrs: Vec<radii_proto::ListenAddr>,
         #[command(flatten)]
         tls: TlsArgs,
     },
@@ -144,23 +144,33 @@ async fn send_hello(
     addr: &str,
     node_id: String,
     roles: Vec<String>,
-    listen_addrs: Vec<String>,
+    listen_addrs: Vec<radii_proto::ListenAddr>,
     tls: TlsArgs,
 ) -> Result<()> {
     let tls = tls.load()?;
     let mut stream = radii_proto::tls::dial(addr, tls.as_ref()).await?;
-    // TASK 3: --listen-addrs and this empty role are a placeholder, not a
-    // decision — replaced by a role-carrying `--listen-addr role=addr` flag.
-    let listen_addrs = listen_addrs
-        .into_iter()
-        .map(|addr| radii_proto::ListenAddr {
-            addr,
-            role: String::new(),
-        })
-        .collect();
     let reply = radii_proto::send_hello_on(&mut stream, node_id, roles, listen_addrs).await?;
     print_reply(reply);
     Ok(())
+}
+
+/// Parses `role=addr`.
+///
+/// `role=addr` rather than `addr:role` because a colon already means a port,
+/// and doubly so in an IPv6 literal.
+fn parse_listen_addr(value: &str) -> Result<radii_proto::ListenAddr, String> {
+    let (role, addr) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected role=addr, got {value:?}"))?;
+    if role.is_empty() || addr.is_empty() {
+        return Err(format!(
+            "expected role=addr with both parts set, got {value:?}"
+        ));
+    }
+    Ok(radii_proto::ListenAddr {
+        addr: addr.to_string(),
+        role: role.to_string(),
+    })
 }
 
 // Mirrors radii_proto::send_report_on's parameter shape, which itself mirrors
@@ -282,5 +292,25 @@ mod tests {
             tls_ca: None,
         };
         assert!(args.load().is_err());
+    }
+
+    #[test]
+    fn parses_role_equals_addr() {
+        let parsed = parse_listen_addr("relay=10.0.0.5:2224").unwrap();
+        assert_eq!(parsed.role, "relay");
+        assert_eq!(parsed.addr, "10.0.0.5:2224");
+    }
+
+    #[test]
+    fn keeps_ipv6_colons_in_the_address() {
+        let parsed = parse_listen_addr("http=[::1]:9000").unwrap();
+        assert_eq!(parsed.addr, "[::1]:9000");
+    }
+
+    #[test]
+    fn rejects_a_value_without_a_role() {
+        assert!(parse_listen_addr("10.0.0.5:2224").is_err());
+        assert!(parse_listen_addr("=10.0.0.5:2224").is_err());
+        assert!(parse_listen_addr("relay=").is_err());
     }
 }
