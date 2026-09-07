@@ -6,9 +6,16 @@
 //! between a relay and a peer that wants all of it: without a per-peer cap
 //! the global cap is decorative, since one identity can consume the lot.
 
+// These tests deliberately do NOT call `wait_ready`. `bind_local` returns a
+// listener that is already bound and listening, so `relay::run` only has to
+// start accepting — a connection made before it does simply waits in the
+// backlog. Probing for readiness would be redundant, and worse: the probe
+// opens a connection of its own, which occupies a pre-admission slot. In a
+// test that caps those slots at one, the probe races the test for the only
+// slot it has.
 use radii_core::routing::{NodeId, ResolvedHop, ResolvedRoute};
+use radii_integration::bind_local;
 use radii_integration::pki::TestCa;
-use radii_integration::{bind_local, wait_ready};
 use radii_proto::tls::TlsIdentity;
 use radii_proto::{read_message, write_message, RadiiMessage, RouteHop};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,6 +64,38 @@ fn route_to(addr: &str) -> ResolvedRoute {
     }
 }
 
+/// Establishes a chain, retrying while the relay is momentarily at
+/// pre-admission capacity.
+///
+/// A pre-admission slot is handed back inside the relay's own task, at the
+/// moment a chain is admitted — which is *after* the initiator has already
+/// seen `establish` succeed. So with a cap of one, the next connection can
+/// legitimately arrive before the previous slot has been released, and be
+/// turned away by a plain TCP close.
+///
+/// That is not a leak, and the property under test is not "a slot is back
+/// instantly" — it is "a slot comes back". Retrying to a deadline encodes
+/// exactly that: if slots genuinely leaked, every attempt inside the window
+/// would fail and this still reports the leak. A fixed sleep would only be
+/// guessing how busy the machine is.
+async fn establish_eventually(
+    route: &ResolvedRoute,
+    identity: &TlsIdentity,
+) -> anyhow::Result<radii_proto::BoxedStream> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last: anyhow::Error = anyhow::anyhow!("never attempted");
+    while std::time::Instant::now() < deadline {
+        match radii_fetch::chain::establish(route, Some(identity), Some(identity)).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last = err;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
 /// With `allow_peers` set, CA membership stops being sufficient — the
 /// operator has narrowed admission to an explicit list.
 #[tokio::test]
@@ -72,7 +111,6 @@ async fn refuses_a_peer_outside_a_configured_allowlist() {
     config.allow_peers = vec!["node-friend".to_string()];
     let runtime = radii_fetch::relay::RelayRuntime::new(config, echo_addr.clone(), None).unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let mut hop = radii_proto::tls::dial_expecting(&relay_addr, Some(&stranger), Some("node-t"))
         .await
@@ -115,7 +153,6 @@ async fn admits_any_ca_valid_peer_when_no_allowlist_is_set() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let mut stream =
         radii_fetch::chain::establish(&route_to(&relay_addr), Some(&stranger), Some(&stranger))
@@ -148,7 +185,6 @@ async fn caps_concurrent_chains_per_peer() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let route = route_to(&relay_addr);
 
@@ -200,7 +236,6 @@ async fn per_peer_cap_is_keyed_by_authenticated_identity_not_shared_globally() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let route = route_to(&relay_addr);
 
@@ -249,7 +284,6 @@ async fn max_concurrent_total_refuses_a_second_peer_once_tripped() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let route = route_to(&relay_addr);
 
@@ -291,7 +325,6 @@ async fn releases_a_slot_when_the_chain_ends() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let route = route_to(&relay_addr);
 
@@ -330,7 +363,6 @@ async fn drops_a_chain_that_goes_idle() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let mut stream =
         radii_fetch::chain::establish(&route_to(&relay_addr), Some(&peer), Some(&peer))
@@ -369,7 +401,6 @@ async fn keeps_a_busy_chain_alive_past_the_idle_window() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let mut stream =
         radii_fetch::chain::establish(&route_to(&relay_addr), Some(&peer), Some(&peer))
@@ -413,12 +444,6 @@ async fn refuses_a_connection_beyond_the_pre_admission_cap() {
     config.max_pending_per_addr = 1;
     let runtime = radii_fetch::relay::RelayRuntime::new(config, echo_addr.clone(), None).unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
-    // `wait_ready` probes by connecting and closing, and that probe itself
-    // occupies a pre-admission slot until its handshake fails. With a cap of
-    // one, assert only after it has drained.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
     // Occupy the single pre-admission slot: connect, then never send a
     // ClientHello, so the relay sits in its TLS accept.
     let _stalled = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
@@ -453,12 +478,6 @@ async fn refuses_a_connection_beyond_the_global_pre_admission_cap() {
     config.max_pending_per_addr = 64; // so the per-address cap cannot be what trips
     let runtime = radii_fetch::relay::RelayRuntime::new(config, echo_addr.clone(), None).unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
-    // See the note in the per-address test: `wait_ready`'s probe holds a
-    // pre-admission slot until its handshake fails, which matters when the
-    // ceiling is one.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
     let _stalled = tokio::net::TcpStream::connect(&relay_addr).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -497,12 +516,11 @@ async fn releases_a_pre_admission_slot_once_a_chain_is_admitted() {
     )
     .unwrap();
     tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
-    wait_ready(&relay_addr).await.unwrap();
 
     let route = route_to(&relay_addr);
     let mut held = Vec::new();
     for attempt in 0..3 {
-        let mut stream = radii_fetch::chain::establish(&route, Some(&peer), Some(&peer))
+        let mut stream = establish_eventually(&route, &peer)
             .await
             .unwrap_or_else(|err| {
                 panic!("attempt {attempt} refused — a pre-admission slot leaked: {err}")
