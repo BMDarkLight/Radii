@@ -1,3 +1,14 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 BMDarkLight
+//
+// This file is part of Radii.
+//
+// Radii is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by the
+// Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version. See the LICENSE file for the full text and
+// additional terms.
+
 //! A chain longer than one hop: the intermediate relay dials the next hop,
 //! passes the tail of the path along, and once the terminal node acks,
 //! carries opaque end-to-end bytes between the initiator and the target.

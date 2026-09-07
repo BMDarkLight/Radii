@@ -1,3 +1,14 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 BMDarkLight
+//
+// This file is part of Radii.
+//
+// Radii is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by the
+// Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version. See the LICENSE file for the full text and
+// additional terms.
+
 use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_head::radii::run_radii_on;
 use radii_integration::{bind_local, wait_ready};

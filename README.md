@@ -147,4 +147,18 @@ Radii is a network-facing project. See [`SECURITY.md`](SECURITY.md) for the thre
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**, with additional terms permitted under AGPLv3 Section 7. See [LICENSE](LICENSE).
+
+This means: you're free to use, study, modify, and redistribute this code, including running it as a network service — but any modified version (or service built on one) must also be released as source under AGPL-3.0, must keep author attribution intact, and must be clearly marked as a different, unaffiliated project (see the Trademark Notice below and the additional terms in [LICENSE](LICENSE)).
+
+### Trademark Notice
+
+"Radii," the Radii name, and its logo/branding are **not** licensed under AGPL-3.0 and are not covered by the code license above. They are trademarks/branding of the original author. The AGPL-3.0 license grants rights to the *source code* — it does not grant permission to use the "Radii" name, logo, or branding for a fork, modified version, or derivative service.
+
+If you fork or modify this project, please:
+- Use a different name and logo that isn't confusingly similar to "Radii"
+- Clearly state that your version is unaffiliated with and not endorsed by the original project
+
+## Author
+
+Built with ❤️ by **Behdad**
