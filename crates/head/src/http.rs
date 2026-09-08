@@ -9,19 +9,31 @@
 // option) any later version. See the LICENSE file for the full text and
 // additional terms.
 
-use crate::decision::{DecisionEngine, DecisionInput, DecisionReason, Protocol};
-use axum::extract::{ConnectInfo, Host, State};
+use crate::decision::{
+    BackendDecision, BackendTarget, DecisionEngine, DecisionInput, DecisionReason, Protocol,
+};
+use anyhow::Context;
+use axum::extract::{ConnectInfo, Host, Request, State};
+use axum::http::header::HeaderMap;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use radii_proto::tls::TlsIdentity;
 use serde::Serialize;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
 pub struct AppState {
     decision: DecisionEngine,
     protocol: Protocol,
+    attempt_timeout: Duration,
+    response_timeout: Duration,
+    /// Identity used for both layers of a chain to a graph-resolved backend.
+    /// Absent means plaintext, matching the rest of the project's opt-in TLS.
+    chain_tls: Option<TlsIdentity>,
 }
 
 #[derive(Serialize)]
@@ -36,16 +48,42 @@ struct HeadResponse {
     decision_reason: String,
 }
 
-pub fn router(decision: DecisionEngine) -> Router {
-    let state = AppState {
-        decision,
-        protocol: Protocol::Http,
-    };
-
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .fallback(any(handle_request))
+        // The decision JSON used to be returned on EVERY path, disclosing
+        // the backend map to any request. It lives on one route now, which
+        // an operator can firewall. That narrows the disclosure; it does not
+        // authenticate it — see SECURITY.md.
+        .route("/_radii/decision", get(decision_json))
+        .fallback(any(proxy_request))
         .with_state(state)
+}
+
+/// State with the defaults, for callers that do not configure timeouts.
+pub fn default_state(decision: DecisionEngine) -> AppState {
+    AppState {
+        decision,
+        protocol: Protocol::Http,
+        attempt_timeout: Duration::from_millis(3000),
+        response_timeout: Duration::from_millis(30_000),
+        chain_tls: None,
+    }
+}
+
+pub fn state_with(
+    decision: DecisionEngine,
+    attempt_timeout: Duration,
+    response_timeout: Duration,
+    chain_tls: Option<TlsIdentity>,
+) -> AppState {
+    AppState {
+        decision,
+        protocol: Protocol::Http,
+        attempt_timeout,
+        response_timeout,
+        chain_tls,
+    }
 }
 
 pub async fn serve_http(bind: &str, decision: DecisionEngine) -> anyhow::Result<()> {
@@ -54,12 +92,16 @@ pub async fn serve_http(bind: &str, decision: DecisionEngine) -> anyhow::Result<
 }
 
 pub async fn serve_http_on(listener: TcpListener, decision: DecisionEngine) -> anyhow::Result<()> {
+    serve_http_on_with(listener, default_state(decision)).await
+}
+
+pub async fn serve_http_on_with(listener: TcpListener, state: AppState) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "head http listening");
 
     axum::serve(
         listener,
-        router(decision).into_make_service_with_connect_info::<SocketAddr>(),
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
 
@@ -70,7 +112,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-async fn handle_request(
+async fn decision_json(
     State(state): State<AppState>,
     connect: ConnectInfo<SocketAddr>,
     host: Option<Host>,
@@ -106,4 +148,119 @@ async fn handle_request(
         candidates: decision.candidates(),
         decision_reason: reason.to_string(),
     }))
+}
+
+/// Forwards a request to the decided backend and streams the response back.
+async fn proxy_request(
+    State(state): State<AppState>,
+    connect: ConnectInfo<SocketAddr>,
+    mut request: Request,
+) -> Response {
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let decision = state.decision.decide(DecisionInput {
+        protocol: state.protocol,
+        protocol_label: None,
+        host: host.as_deref(),
+        source: Some(connect.0),
+        destination_port: None,
+        attributes: &[],
+    });
+
+    add_forwarded_headers(request.headers_mut(), &connect.0, host.as_deref());
+
+    let stream = match connect_backend(&state, &decision).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(
+                source = %connect.0,
+                host = ?host,
+                backend = %decision.backend(),
+                error = %err,
+                "no backend could be reached"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    match crate::proxy::forward(stream, request, state.response_timeout).await {
+        Ok(response) => response,
+        Err(err) => {
+            // Past this point the request has been written, so this is not
+            // retried: Head cannot know whether the backend processed it.
+            tracing::warn!(
+                source = %connect.0,
+                backend = %decision.backend(),
+                error = %err,
+                "proxy forward failed after the request was sent"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+/// Records the immediate peer in the `X-Forwarded-*` headers.
+///
+/// An inbound `X-Forwarded-For` is appended to, never replaced — and never
+/// believed. Any client can send one, Head makes no access-control decision
+/// on it, and nothing downstream should treat it as authenticated. It is
+/// provenance for a log, not a credential.
+fn add_forwarded_headers(headers: &mut HeaderMap, peer: &SocketAddr, host: Option<&str>) {
+    let chain = match headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(prior) => format!("{prior}, {}", peer.ip()),
+        None => peer.ip().to_string(),
+    };
+    if let Ok(value) = chain.parse() {
+        headers.insert("x-forwarded-for", value);
+    }
+    if let Ok(value) = "http".parse() {
+        headers.insert("x-forwarded-proto", value);
+    }
+    if let Some(host) = host {
+        if let Ok(value) = host.parse() {
+            headers.insert("x-forwarded-host", value);
+        }
+    }
+}
+
+/// Opens a connection to the decided backend.
+async fn connect_backend(
+    state: &AppState,
+    decision: &BackendDecision,
+) -> anyhow::Result<radii_proto::BoxedStream> {
+    match &decision.target {
+        // A statically configured backend has no node identity — it came
+        // from the operator's own config and may point at a host that is not
+        // part of the mesh — so it is dialed directly, exactly as Fetch
+        // dials its static `upstream` fallback and for the same reason.
+        BackendTarget::Direct(addr) => {
+            let addr = radii_fetch::server::normalize_upstream(addr);
+            let stream =
+                tokio::time::timeout(state.attempt_timeout, tokio::net::TcpStream::connect(&addr))
+                    .await
+                    .context("timed out dialing the configured backend")?
+                    .context("could not dial the configured backend")?;
+            Ok(Box::new(stream))
+        }
+        BackendTarget::Chain(routes) => {
+            let route = routes.first().context("no reachable candidate")?;
+            tokio::time::timeout(
+                state.attempt_timeout,
+                radii_fetch::chain::establish(
+                    route,
+                    state.chain_tls.as_ref(),
+                    state.chain_tls.as_ref(),
+                ),
+            )
+            .await
+            .context("timed out establishing a chain to the backend")?
+        }
+    }
 }

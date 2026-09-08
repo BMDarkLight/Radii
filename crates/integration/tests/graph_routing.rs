@@ -13,6 +13,9 @@ use radii_crawl::server::{run_on_with_state, CrawlState};
 use radii_head::decision::{DecisionEngine, GraphRoutePolicy};
 use radii_head::graph::{self, GraphState};
 use radii_head::http::serve_http_on;
+// The decision JSON moved off the fallback route, which now proxies, so
+// these tests ask `/_radii/decision` for it. What they assert about the
+// decision itself is unchanged.
 use radii_integration::{bind_local, wait_ready};
 use radii_proto::{write_message, ListenAddr, RadiiMessage};
 use std::collections::HashMap;
@@ -129,7 +132,7 @@ async fn head_resolves_backend_from_crawl_graph() {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("http://{head_addr}/x"))
+        .get(format!("http://{head_addr}/_radii/decision"))
         .header("Host", "example.com")
         .send()
         .await

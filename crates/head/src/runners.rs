@@ -9,19 +9,19 @@
 // option) any later version. See the LICENSE file for the full text and
 // additional terms.
 
-use crate::{config, decision::DecisionEngine, graph, http, radii};
+use crate::{config, graph, http, radii};
 use radii_core::registry::{BoxFuture, ProtocolRunner};
 use radii_proto::tls::TlsIdentity;
 use std::sync::Arc;
 
 pub struct HttpRunner {
     bind: String,
-    decision: DecisionEngine,
+    state: http::AppState,
 }
 
 impl HttpRunner {
-    pub fn new(bind: String, decision: DecisionEngine) -> Self {
-        Self { bind, decision }
+    pub fn new(bind: String, state: http::AppState) -> Self {
+        Self { bind, state }
     }
 }
 
@@ -32,8 +32,11 @@ impl ProtocolRunner for HttpRunner {
 
     fn start(&self) -> BoxFuture<'_> {
         let bind = self.bind.clone();
-        let decision = self.decision.clone();
-        Box::pin(async move { http::serve_http(&bind, decision).await })
+        let state = self.state.clone();
+        Box::pin(async move {
+            let listener = tokio::net::TcpListener::bind(&bind).await?;
+            http::serve_http_on_with(listener, state).await
+        })
     }
 }
 

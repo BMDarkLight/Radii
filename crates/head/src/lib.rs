@@ -13,6 +13,7 @@ pub mod config;
 pub mod decision;
 pub mod graph;
 pub mod http;
+pub mod proxy;
 pub mod radii;
 pub mod runners;
 
@@ -42,7 +43,12 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     let registry = ProtocolRegistry::new()
         .register(runners::HttpRunner::new(
             config.http.bind.clone(),
-            decision.clone(),
+            http::state_with(
+                decision.clone(),
+                std::time::Duration::from_millis(config.http.attempt_timeout_ms),
+                std::time::Duration::from_millis(config.http.response_timeout_ms),
+                tls.clone(),
+            ),
         ))
         .register(runners::RadiiRunner::maybe_new(
             config.radii.clone(),

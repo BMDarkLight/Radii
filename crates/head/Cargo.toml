@@ -13,6 +13,9 @@ path = "src/lib.rs"
 anyhow = "1"
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 radii-core = { path = "../core" }
 radii-fetch = { path = "../fetch" }
 radii-proto = { path = "../proto" }

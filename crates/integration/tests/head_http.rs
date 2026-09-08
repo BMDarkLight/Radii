@@ -11,6 +11,9 @@
 
 use radii_head::decision::DecisionEngine;
 use radii_head::http::serve_http_on;
+// The decision JSON moved off the fallback route, which now proxies, so
+// these tests ask `/_radii/decision` for it. What they assert about the
+// decision itself is unchanged.
 use radii_integration::{bind_local, wait_ready};
 use std::collections::HashMap;
 
@@ -34,7 +37,7 @@ async fn health_and_host_map_decision() {
     assert_eq!(health.status(), 200);
 
     let matched = client
-        .get(format!("{base}/x"))
+        .get(format!("{base}/_radii/decision"))
         .header("Host", "example.com")
         .send()
         .await
@@ -46,7 +49,7 @@ async fn health_and_host_map_decision() {
     assert_eq!(matched["decision_reason"], "host_map");
 
     let fallback = client
-        .get(format!("{base}/y"))
+        .get(format!("{base}/_radii/decision"))
         .header("Host", "other.local")
         .send()
         .await
@@ -122,7 +125,7 @@ async fn head_reports_ranked_candidates() {
     wait_ready(&addr).await.unwrap();
 
     let response = reqwest::Client::new()
-        .get(format!("http://{addr}/x"))
+        .get(format!("http://{addr}/_radii/decision"))
         .header("Host", "site.example")
         .send()
         .await

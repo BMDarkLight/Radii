@@ -30,6 +30,24 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct HttpConfig {
     pub bind: String,
+    /// Bounds one candidate's connection setup — for a graph-resolved
+    /// backend that is chain establishment plus the HTTP handshake.
+    #[serde(default = "default_attempt_timeout_ms")]
+    pub attempt_timeout_ms: u64,
+    /// Bounds waiting for response headers after the request is sent.
+    /// Deliberately not a limit on body streaming: a slow large download is
+    /// legitimate, and capping it would break exactly the case streaming
+    /// exists to serve.
+    #[serde(default = "default_response_timeout_ms")]
+    pub response_timeout_ms: u64,
+}
+
+fn default_attempt_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_response_timeout_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
