@@ -1,5 +1,11 @@
 [http]
 bind = "0.0.0.0:8080"
+# Bounds one candidate's connection setup — chain establishment plus the HTTP
+# handshake for a graph-resolved backend, or the TCP dial for a static one.
+attempt_timeout_ms = 3000
+# Bounds waiting for response headers after the request is sent. Deliberately
+# NOT a limit on body streaming: a slow large download is legitimate.
+response_timeout_ms = 30000
 
 [radii]
 bind = "0.0.0.0:7000"

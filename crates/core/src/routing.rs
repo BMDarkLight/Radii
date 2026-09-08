@@ -54,7 +54,17 @@ impl RoleId {
     /// A relay listener: mutual TLS plus a `TunnelOpen` preamble. What Fetch
     /// reaches a node over, including as a chain's final hop.
     pub const RELAY: &'static str = "relay";
-    /// A plain HTTP backend, dialed directly. What Head hands its callers.
+    /// A plain HTTP backend, dialed directly.
+    ///
+    /// **Reserved: nothing resolves this today.** Head reaches backends over
+    /// source-routed chains, which terminate at a target's relay listener,
+    /// so it resolves [`RoleId::RELAY`] exactly as Fetch does. The constant
+    /// is kept because removing it would churn the wire for no gain — and
+    /// named explicitly as unused so it does not look load-bearing. This
+    /// project already carries one decorative field in node-level `roles`,
+    /// and a second should not accumulate silently. Delete it if no consumer
+    /// appears, or give it one by adding a direct-dial mode for backends
+    /// that are not behind a Radii node.
     pub const HTTP: &'static str = "http";
 
     pub fn new<S: Into<String>>(value: S) -> Self {

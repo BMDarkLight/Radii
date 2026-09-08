@@ -64,3 +64,66 @@ role from a node's advertised addresses: Head resolves the `http` role for
 the backend it hands its callers, Fetch resolves the `relay` role for every
 hop it plans. A node that should serve both must advertise both, e.g.
 `--listen-addr relay=HOST:PORT --listen-addr http=HOST:PORT`.
+
+## Proxying
+
+Head forwards the request to the backend it decides on and streams the
+response back. Bodies are never buffered in either direction, so memory per
+connection stays constant regardless of upload or download size.
+
+### Two ways to reach a backend
+
+A **graph-resolved** backend is a *node*. Head opens a source-routed chain to
+it; the chain terminates at that node's relay listener, which splices to the
+node's own configured `upstream` — and that upstream is the web server. Head
+therefore resolves `relay` addresses, exactly as Fetch does.
+
+A **statically configured** backend (`[routing.host_map]`, `default_backend`)
+carries no node identity at all — it came from the operator's own config and
+may point at a host that is not part of the mesh. It is dialed directly, the
+same way Fetch dials its static `upstream` fallback and for the same reason.
+It has one address, so there is nothing to fail over to.
+
+### The retry boundary
+
+A candidate is retried **only when its chain failed to establish** — the
+request was never delivered, so replaying it is unambiguous for any method,
+POST included.
+
+Once the request has been written, a failure is terminal and reaches the
+client as a 502. Head cannot know whether the backend processed it, and
+replaying could duplicate a POST. This is why no request body is buffered:
+buffering exists only to enable replay, and replay stops at that boundary.
+
+The rule is narrower than it sounds, because a relay dials its own upstream
+*before* acknowledging a chain — so a dead origin fails at establishment, and
+is covered.
+
+### Headers
+
+Hop-by-hop headers are stripped in both directions: `Connection`,
+`Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
+`Transfer-Encoding`, `Upgrade`, **and every header named inside the message's
+own `Connection` header**. That last set is what implementations usually miss,
+and forwarding one to a backend is request-smuggling surface.
+
+`Host` is forwarded unchanged, so the backend can serve the right virtual
+host — that is what makes the host-to-node mapping mean anything.
+
+`X-Forwarded-For` gets the immediate peer appended to any inbound value. The
+inbound value is **recorded, not believed**: any client can send one, Head
+makes no access-control decision on it, and nothing downstream should treat it
+as authenticated.
+
+### Known limitation: a fresh chain per request
+
+Chain setup is a TCP connect, a hop-local TLS handshake, a `TunnelOpen` round
+trip, and an end-to-end TLS handshake — roughly three round trips.
+Sub-millisecond on a LAN; 100ms+ per request over a WAN, which makes a page
+with thirty assets unusable.
+
+This is a deliberate first-version choice. Pooling chains would fix the
+latency but holds a relay's concurrency slot continuously rather than per
+request — on donated public nodes that is someone else's bandwidth and
+someone else's `max_concurrent_per_peer` budget, held whether or not traffic
+flows. That deserves its own decision.
