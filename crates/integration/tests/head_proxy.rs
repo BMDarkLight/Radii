@@ -278,3 +278,115 @@ async fn streams_a_response_larger_than_a_buffer() {
     assert_eq!(body.len(), 512 * 1024, "the whole body must arrive intact");
     handle.abort();
 }
+
+/// The feature, end to end: a client makes an ordinary HTTP request, the
+/// response comes from an origin reached over a source-routed relay chain,
+/// and when the first candidate's node is dead the client still gets the
+/// response from the second — never observing the failure.
+///
+/// This is the test the whole reverse-proxy design exists for. Before it,
+/// Head returned JSON and none of the source-routing work reached HTTP.
+#[tokio::test]
+async fn fails_over_to_a_second_node_without_the_client_noticing() {
+    use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
+    use radii_head::decision::GraphRoutePolicy;
+    use radii_head::graph::{GraphState, SharedGraphState};
+    use radii_integration::pki::TestCa;
+    use radii_proto::tls::TlsIdentity;
+    use std::sync::{Arc, RwLock};
+
+    let ca = TestCa::new();
+    let head_identity = TlsIdentity::load(&ca.issue("head")).unwrap();
+
+    let (origin_listener, origin_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_origin(origin_listener, "served by node-c"));
+
+    // Only node-c is actually running.
+    let (relay_listener, relay_addr) = bind_local().await.unwrap();
+    let runtime = radii_fetch::relay::RelayRuntime::new(
+        radii_fetch::config::RelayConfig {
+            bind: relay_addr.clone(),
+            node_id: "node-c".to_string(),
+            max_hops: 8,
+            max_concurrent_total: 16,
+            max_concurrent_per_peer: 8,
+            idle_timeout_ms: 30_000,
+            handshake_timeout_ms: 10_000,
+            max_pending_total: 256,
+            max_pending_per_addr: 64,
+            allow_peers: Vec::new(),
+            tls: Some(ca.issue("node-c")),
+        },
+        origin_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-c")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(relay_listener, runtime));
+
+    let mut snapshot = GraphSnapshot::new();
+    for to in ["node-b", "node-c"] {
+        snapshot.add_link(Link {
+            from: NodeId("head".into()),
+            to: NodeId(to.into()),
+            protocol: ProtocolId::new("http"),
+            reachable: true,
+            // node-b looks cheaper so it is tried first — and it is dead.
+            latency_ms: Some(if to == "node-b" { 10 } else { 200 }),
+        });
+    }
+    let mut listen_addrs: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    listen_addrs.insert(
+        "node-b".into(),
+        vec![("127.0.0.1:1".into(), "relay".into())],
+    );
+    listen_addrs.insert("node-c".into(), vec![(relay_addr.clone(), "relay".into())]);
+    let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
+        snapshot,
+        listen_addrs,
+    }));
+
+    let mut node_map = HashMap::new();
+    node_map.insert(
+        "site.example".to_string(),
+        vec!["node-b".to_string(), "node-c".to_string()],
+    );
+    let policy = GraphRoutePolicy::new(
+        node_map,
+        "head".to_string(),
+        vec!["http".to_string()],
+        4,
+        3,
+        state,
+    );
+    let decision = DecisionEngine::new().with_policy(policy);
+
+    let (listener, addr) = bind_local().await.unwrap();
+    let handle = tokio::spawn(async move {
+        radii_head::http::serve_http_on_with(
+            listener,
+            radii_head::http::state_with(
+                decision,
+                std::time::Duration::from_millis(3000),
+                std::time::Duration::from_millis(30_000),
+                Some(head_identity),
+            ),
+        )
+        .await
+    });
+
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .header("Host", "site.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body, "served by node-c",
+        "the client must get the live node's response without ever seeing the dead one"
+    );
+    handle.abort();
+}

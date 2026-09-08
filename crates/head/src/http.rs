@@ -250,17 +250,63 @@ async fn connect_backend(
             Ok(Box::new(stream))
         }
         BackendTarget::Chain(routes) => {
-            let route = routes.first().context("no reachable candidate")?;
-            tokio::time::timeout(
-                state.attempt_timeout,
-                radii_fetch::chain::establish(
-                    route,
-                    state.chain_tls.as_ref(),
-                    state.chain_tls.as_ref(),
-                ),
-            )
-            .await
-            .context("timed out establishing a chain to the backend")?
+            let mut last: anyhow::Error = anyhow::anyhow!("no reachable candidate");
+            for (index, route) in routes.iter().enumerate() {
+                // Retrying is safe here and ONLY here: a chain that failed
+                // to establish never delivered the request, so replaying it
+                // is unambiguous for any method, POST included. Once the
+                // request has been written, a failure is terminal — Head
+                // cannot know whether the backend processed it — and the
+                // caller turns it into a 502 rather than trying elsewhere.
+                let attempt = tokio::time::timeout(
+                    state.attempt_timeout,
+                    radii_fetch::chain::establish(
+                        route,
+                        state.chain_tls.as_ref(),
+                        state.chain_tls.as_ref(),
+                    ),
+                )
+                .await;
+
+                let addr = route
+                    .hops
+                    .last()
+                    .map(|hop| hop.addr.as_str())
+                    .unwrap_or("<no-hops>");
+
+                match attempt {
+                    Ok(Ok(stream)) => {
+                        tracing::info!(
+                            candidate = index,
+                            target = %route.target().0,
+                            %addr,
+                            "head established a chain to a backend"
+                        );
+                        return Ok(stream);
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            candidate = index,
+                            target = %route.target().0,
+                            %addr,
+                            error = %err,
+                            "candidate failed; trying the next"
+                        );
+                        last = err;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            candidate = index,
+                            target = %route.target().0,
+                            %addr,
+                            timeout_ms = state.attempt_timeout.as_millis(),
+                            "candidate timed out; trying the next"
+                        );
+                        last = anyhow::anyhow!("candidate timed out");
+                    }
+                }
+            }
+            Err(last)
         }
     }
 }
