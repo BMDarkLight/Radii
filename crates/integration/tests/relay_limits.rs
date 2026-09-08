@@ -394,6 +394,12 @@ async fn drops_a_chain_that_goes_idle() {
 /// Traffic keeps a chain alive past the idle window. Guards against the
 /// watchdog being a total deadline rather than an inactivity timer — that
 /// mistake would kill every long-lived tunnel.
+///
+/// The gap between round trips is deliberately a fifth of the idle window,
+/// not two thirds of it: the property under test is "activity resets the
+/// clock", and a test that only just clears the deadline is really testing
+/// how loaded the machine is. Total elapsed still far exceeds the window,
+/// which is what makes this a deadline-vs-inactivity test at all.
 #[tokio::test]
 async fn keeps_a_busy_chain_alive_past_the_idle_window() {
     let ca = TestCa::new();
@@ -404,7 +410,7 @@ async fn keeps_a_busy_chain_alive_past_the_idle_window() {
 
     let (relay_listener, relay_addr) = bind_local().await.unwrap();
     let mut config = relay_config(&ca, "node-t", &relay_addr);
-    config.idle_timeout_ms = 300;
+    config.idle_timeout_ms = 1000;
     let runtime = radii_fetch::relay::RelayRuntime::new(
         config,
         echo_addr.clone(),
@@ -419,7 +425,7 @@ async fn keeps_a_busy_chain_alive_past_the_idle_window() {
             .unwrap();
 
     // Six round trips spanning ~1.2s, four times the idle window.
-    for _ in 0..6 {
+    for _ in 0..8 {
         stream.write_all(b"tick").await.unwrap();
         let mut buf = [0u8; 4];
         stream
