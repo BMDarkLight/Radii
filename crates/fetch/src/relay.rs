@@ -553,14 +553,26 @@ async fn forward(
     Ok(Some((inbound, outbound)))
 }
 
-/// Copies in both directions until either side closes, or until neither
+/// Copies in both directions until *both* are done, or until neither
 /// direction has moved a byte for `idle`.
+///
+/// Both, not either. A client that finishes sending and shuts down its write
+/// side — HTTP/1.0, `curl --http1.0`, an SSH session closing stdin — is not a
+/// closed connection, it is a half-closed one, and the response is still owed.
+/// Returning as soon as the first direction saw EOF cancelled the other
+/// direction mid-flight and dropped the entire response on the floor;
+/// `pump` already shuts down the peer's write side when it reaches EOF, so
+/// each direction terminates on its own and waiting for both is what lets a
+/// half-close mean what it means. `server::handle_connection` splices with
+/// `try_join!` for exactly this reason, and the two paths now agree.
 ///
 /// "Idle" is deliberately a property of the chain, not of one direction. A
 /// legitimate tunnel is often quiet one way for a long time — a shell session
 /// waiting on the user, a stream the client is only reading — so timing each
 /// direction independently would kill working chains. Both directions share
-/// one last-activity clock and a watchdog reads it.
+/// one last-activity clock and a watchdog reads it. The watchdog is what
+/// bounds the half-closed case: after one side is done the other cannot hang
+/// forever, it hangs for at most `idle`.
 ///
 /// This closes, for the relay path, the connection-timeout gap `SECURITY.md`
 /// records as outstanding: without it a peer can complete a handshake, be
@@ -589,9 +601,15 @@ pub(crate) async fn splice_with_idle(a: BoxedStream, b: BoxedStream, idle: Durat
         }
     };
 
+    // `try_join!` rather than two `select!` arms: it resolves only once both
+    // directions have finished, and still short-circuits on a genuine error
+    // (which, unlike EOF, means the chain is broken rather than half-closed).
+    let both = async {
+        tokio::try_join!(pump(&mut ar, &mut bw, &last), pump(&mut br, &mut aw, &last)).map(|_| ())
+    };
+
     tokio::select! {
-        result = pump(&mut ar, &mut bw, &last) => result,
-        result = pump(&mut br, &mut aw, &last) => result,
+        result = both => result,
         _ = watchdog => {
             tracing::info!(idle_ms = idle.as_millis(), "relay dropped an idle chain");
             Ok(())

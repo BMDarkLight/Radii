@@ -258,13 +258,25 @@ async fn handle_connection(inbound: BoxedStream, outbound: BoxedStream) -> anyho
 }
 
 /// Normalize configured upstream addresses by stripping known URL-style prefixes.
+///
+/// Every scheme listed here means the same thing to a caller: open a plain TCP
+/// connection to this host and port. `http://` is included because it is the
+/// spelling the shipped configs use for a backend — `routing.default_backend`
+/// and every `routing.host_map` value in `head.example.toml` carry it — and
+/// Head hands the result straight to `TcpStream::connect`. Leaving it on made
+/// the whole static-backend path fail name resolution and answer 502, on the
+/// example config, out of the box.
+///
+/// `https://` is deliberately NOT stripped. Nothing in this project speaks TLS
+/// to a backend — Head runs a cleartext HTTP/1 handshake over whatever stream
+/// it gets — so stripping it would turn a misconfiguration into cleartext sent
+/// at a TLS port, which is worse than the connection failing.
 pub fn normalize_upstream(upstream: &str) -> String {
     let trimmed = upstream.trim();
-    if let Some(stripped) = trimmed.strip_prefix("ssh://") {
-        return stripped.to_string();
-    }
-    if let Some(stripped) = trimmed.strip_prefix("tcp://") {
-        return stripped.to_string();
+    for scheme in ["ssh://", "tcp://", "http://"] {
+        if let Some(stripped) = trimmed.strip_prefix(scheme) {
+            return stripped.to_string();
+        }
     }
     trimmed.to_string()
 }
@@ -278,5 +290,32 @@ mod tests {
         assert_eq!(normalize_upstream("  ssh://127.0.0.1:22 "), "127.0.0.1:22");
         assert_eq!(normalize_upstream("tcp://10.0.0.1:443"), "10.0.0.1:443");
         assert_eq!(normalize_upstream("127.0.0.1:9000"), "127.0.0.1:9000");
+    }
+
+    /// The exact spelling `head.example.toml` ships for `default_backend` and
+    /// for every `host_map` value. Left unstripped, Head passed it to
+    /// `TcpStream::connect`, name resolution failed, and every request to a
+    /// statically configured backend answered 502.
+    #[test]
+    fn strips_the_http_scheme_the_example_configs_use() {
+        assert_eq!(
+            normalize_upstream("http://127.0.0.1:9000"),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(
+            normalize_upstream("http://10.0.0.10:9000"),
+            "10.0.0.10:9000"
+        );
+    }
+
+    /// Not stripped on purpose: nothing here speaks TLS to a backend, so
+    /// accepting the spelling would send cleartext at a TLS port rather than
+    /// failing. The dial fails instead, which is the honest outcome.
+    #[test]
+    fn leaves_https_alone_rather_than_downgrading_it() {
+        assert_eq!(
+            normalize_upstream("https://10.0.0.10:443"),
+            "https://10.0.0.10:443"
+        );
     }
 }

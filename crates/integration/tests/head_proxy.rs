@@ -390,3 +390,48 @@ async fn fails_over_to_a_second_node_without_the_client_noticing() {
     );
     handle.abort();
 }
+
+/// The backend spelling every shipped config uses.
+///
+/// `head.example.toml` writes `routing.default_backend` and every
+/// `routing.host_map` value as `http://HOST:PORT`, and Head hands the decided
+/// address to `TcpStream::connect`. `normalize_upstream` stripped `ssh://`
+/// and `tcp://` but not `http://`, so name resolution failed and every
+/// request to a statically configured backend answered 502 — on the example
+/// config, out of the box. The existing proxy tests all pass a bare
+/// `host:port` from `bind_local`, so none of them could see it.
+#[tokio::test]
+async fn proxies_to_a_static_backend_written_with_an_http_scheme() {
+    let (origin_listener, origin_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_origin(origin_listener, "hello from origin"));
+
+    let with_scheme = format!("http://{origin_addr}");
+    let mut host_map = HashMap::new();
+    host_map.insert("example.com".to_string(), with_scheme.clone());
+    // Both the host_map hit and the default carry the scheme, since both
+    // reach the same dial.
+    let decision = DecisionEngine::from_config(&routing(&with_scheme, host_map));
+
+    let (listener, addr) = bind_local().await.unwrap();
+    let handle = tokio::spawn(async move { serve_http_on(listener, decision).await });
+
+    let mapped = reqwest::Client::new()
+        .get(format!("http://{addr}/some/path"))
+        .header("Host", "example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mapped.status(), 200, "host_map backend must be reachable");
+    assert_eq!(mapped.text().await.unwrap(), "hello from origin");
+
+    let defaulted = reqwest::Client::new()
+        .get(format!("http://{addr}/some/path"))
+        .header("Host", "unmapped.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(defaulted.status(), 200, "default backend must be reachable");
+    assert_eq!(defaulted.text().await.unwrap(), "hello from origin");
+
+    handle.abort();
+}
