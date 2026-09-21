@@ -99,6 +99,23 @@ async fn fetch_once(
 /// of a chain it establishes. Resolving `http` here would name an endpoint
 /// Head never dials directly once it proxies over chains, so it resolves the
 /// same role Fetch does.
+///
+/// Intermediates are resolved too (`hop_role: Some(RELAY)`), for the same
+/// reason and with the same value Fetch passes. While Head only printed a
+/// decision, passing `None` was right: it handed its caller the target's
+/// address and never touched the path. Once it began establishing chains
+/// that became wrong in a way nothing could see — `None` drops intermediates
+/// from the resolved route rather than failing it, so a planned
+/// `head → node-r → node-b` collapsed to a one-hop chain that dialed
+/// `node-b` directly, at an address the graph never said Head could reach.
+/// Multi-hop routing silently did not happen, and a route that only worked
+/// via a relay looked identical to one that did not need it.
+///
+/// The cost of resolving them is that a path whose intermediate advertises
+/// no `relay` address is now dropped instead of collapsed. That is correct —
+/// Head cannot dial a hop it has no address for — but it does mean a
+/// registry missing relay tags yields fewer candidates rather than
+/// silently-direct ones.
 pub fn plan_backends(
     state: &SharedGraphState,
     source: &NodeId,
@@ -118,7 +135,7 @@ pub fn plan_backends(
         allowed_protocols,
         max_hops,
         limit,
-        None,
+        Some(&RoleId::new(RoleId::RELAY)),
         &RoleId::new(RoleId::RELAY),
     )
 }
@@ -149,6 +166,18 @@ mod tests {
         }))
     }
 
+    /// Adds a `relay` listen address for a node the default fixture omits.
+    fn register_relay(state: &mut SharedGraphState, node_id: &str, addr: &str) {
+        state
+            .write()
+            .expect("graph state poisoned")
+            .listen_addrs
+            .insert(
+                node_id.to_string(),
+                vec![(addr.to_string(), "relay".to_string())],
+            );
+    }
+
     #[test]
     fn resolves_backend_for_reachable_route() {
         let state = state_with(vec![("head", "node-b", "http", true, Some(15))]);
@@ -177,5 +206,70 @@ mod tests {
             3,
         );
         assert!(routes.is_empty());
+    }
+
+    /// A graph where the target is reachable ONLY through an intermediate.
+    ///
+    /// The resolved route must name both hops in order, because that list is
+    /// what `chain::establish` dials and sends as the `TunnelOpen` path. With
+    /// `hop_role: None` the intermediate was dropped instead of resolved and
+    /// this collapsed to `[node-b]` — a one-hop chain dialing `node-b`
+    /// directly, at an address the graph never said Head could reach.
+    #[test]
+    fn a_multi_hop_route_keeps_its_intermediate_hops() {
+        let mut state = state_with(vec![
+            ("head", "node-r", "http", true, Some(10)),
+            ("node-r", "node-b", "http", true, Some(10)),
+        ]);
+        // No direct head -> node-b link: the only way there is via node-r.
+        register_relay(&mut state, "node-r", "10.0.0.9:9000");
+
+        let routes = plan_backends(
+            &state,
+            &NodeId("head".into()),
+            &[NodeId("node-b".into())],
+            &[ProtocolId::new("http")],
+            4,
+            3,
+        );
+
+        let route = routes.first().expect("the target is reachable via node-r");
+        let path: Vec<(&str, &str)> = route
+            .hops
+            .iter()
+            .map(|hop| (hop.node_id.0.as_str(), hop.addr.as_str()))
+            .collect();
+        assert_eq!(
+            path,
+            vec![("node-r", "10.0.0.9:9000"), ("node-b", "10.0.0.5:9000")],
+            "the chain must traverse node-r, not dial node-b directly"
+        );
+    }
+
+    /// The cost of resolving intermediates: a path through a node that
+    /// advertises no `relay` address is dropped, not silently collapsed to a
+    /// direct dial of the target. Head has no address for that hop, so the
+    /// route is not one it can open.
+    #[test]
+    fn a_route_through_an_unaddressable_intermediate_is_dropped() {
+        // node-r is never registered in `listen_addrs`.
+        let state = state_with(vec![
+            ("head", "node-r", "http", true, Some(10)),
+            ("node-r", "node-b", "http", true, Some(10)),
+        ]);
+
+        let routes = plan_backends(
+            &state,
+            &NodeId("head".into()),
+            &[NodeId("node-b".into())],
+            &[ProtocolId::new("http")],
+            4,
+            3,
+        );
+
+        assert!(
+            routes.is_empty(),
+            "a hop with no relay address cannot be dialed, so the route is unusable"
+        );
     }
 }

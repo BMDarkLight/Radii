@@ -435,3 +435,142 @@ async fn proxies_to_a_static_backend_written_with_an_http_scheme() {
 
     handle.abort();
 }
+
+/// Head reaches a backend that is only reachable *through* another node.
+///
+/// `head → node-r → node-b`, with no direct `head → node-b` link in the
+/// graph. Head must open a two-hop chain: dial node-r, hand it the tail, and
+/// speak end-to-end with node-b through it.
+///
+/// node-b's relay sets `allow_peers = ["node-r"]`, which is what makes the
+/// regression visible rather than merely theoretical. Every listener in a
+/// test lives on 127.0.0.1, so a collapsed one-hop chain straight to node-b
+/// would *connect* — and would have passed a test that only asserted on the
+/// body. With the allow-list, node-b admits a chain handed to it by node-r
+/// and refuses one dialed by head, so the two behaviours give different
+/// answers: 200 for the real chain, 502 for the collapse.
+///
+/// Before this, `plan_backends` passed `hop_role: None`, which dropped
+/// node-r from the resolved route instead of resolving it. Head planned
+/// through node-r and then dialed node-b directly, at an address the graph
+/// never said it could reach. Multi-hop routing silently did not happen.
+#[tokio::test]
+async fn reaches_a_backend_only_through_an_intermediate_relay() {
+    use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};
+    use radii_head::decision::GraphRoutePolicy;
+    use radii_head::graph::{GraphState, SharedGraphState};
+    use radii_integration::pki::TestCa;
+    use radii_proto::tls::TlsIdentity;
+    use std::sync::{Arc, RwLock};
+
+    fn relay_config(
+        ca: &TestCa,
+        node_id: &str,
+        bind: &str,
+        allow_peers: Vec<String>,
+    ) -> radii_fetch::config::RelayConfig {
+        radii_fetch::config::RelayConfig {
+            bind: bind.to_string(),
+            node_id: node_id.to_string(),
+            max_hops: 8,
+            max_concurrent_total: 16,
+            max_concurrent_per_peer: 8,
+            idle_timeout_ms: 30_000,
+            handshake_timeout_ms: 10_000,
+            max_pending_total: 256,
+            max_pending_per_addr: 64,
+            allow_peers,
+            tls: Some(ca.issue(node_id)),
+        }
+    }
+
+    let ca = TestCa::new();
+    let head_identity = TlsIdentity::load(&ca.issue("head")).unwrap();
+
+    let (origin_listener, origin_addr) = bind_local().await.unwrap();
+    tokio::spawn(run_origin(origin_listener, "served through node-r"));
+
+    // The terminal, which only accepts chains handed to it by node-r.
+    let (b_listener, b_addr) = bind_local().await.unwrap();
+    let b_runtime = radii_fetch::relay::RelayRuntime::new(
+        relay_config(&ca, "node-b", &b_addr, vec!["node-r".to_string()]),
+        origin_addr.clone(),
+        Some(TlsIdentity::load(&ca.issue("node-b")).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(b_listener, b_runtime));
+
+    // The intermediate. Forwards only, so its own upstream is never used.
+    let (r_listener, r_addr) = bind_local().await.unwrap();
+    let r_runtime = radii_fetch::relay::RelayRuntime::new(
+        relay_config(&ca, "node-r", &r_addr, Vec::new()),
+        "127.0.0.1:1".to_string(),
+        None,
+    )
+    .unwrap();
+    tokio::spawn(radii_fetch::relay::run(r_listener, r_runtime));
+
+    // head -> node-r -> node-b. Deliberately no direct head -> node-b link.
+    let mut snapshot = GraphSnapshot::new();
+    for (from, to) in [("head", "node-r"), ("node-r", "node-b")] {
+        snapshot.add_link(Link {
+            from: NodeId(from.into()),
+            to: NodeId(to.into()),
+            protocol: ProtocolId::new("http"),
+            reachable: true,
+            latency_ms: Some(10),
+        });
+    }
+    let mut listen_addrs: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    listen_addrs.insert("node-r".into(), vec![(r_addr.clone(), "relay".into())]);
+    listen_addrs.insert("node-b".into(), vec![(b_addr.clone(), "relay".into())]);
+    let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
+        snapshot,
+        listen_addrs,
+    }));
+
+    let mut node_map = HashMap::new();
+    node_map.insert("site.example".to_string(), vec!["node-b".to_string()]);
+    let policy = GraphRoutePolicy::new(
+        node_map,
+        "head".to_string(),
+        vec!["http".to_string()],
+        4,
+        3,
+        state,
+    );
+    // No host_map and no default: a fallback would mask a collapsed chain
+    // behind some other backend's response. The graph route is the only way
+    // this request can be served.
+    let decision = DecisionEngine::new().with_policy(policy);
+
+    let (listener, addr) = bind_local().await.unwrap();
+    let handle = tokio::spawn(async move {
+        radii_head::http::serve_http_on_with(
+            listener,
+            radii_head::http::state_with(
+                decision,
+                std::time::Duration::from_millis(3000),
+                std::time::Duration::from_millis(30_000),
+                Some(head_identity),
+            ),
+        )
+        .await
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .header("Host", "site.example")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "Head must open a two-hop chain through node-r; a collapsed one-hop \
+         chain is refused by node-b and surfaces as 502"
+    );
+    assert_eq!(response.text().await.unwrap(), "served through node-r");
+    handle.abort();
+}

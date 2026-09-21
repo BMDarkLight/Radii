@@ -244,10 +244,16 @@ pub fn resolve_candidates(
 
             for (index, node) in candidate.hops.iter().enumerate().skip(1) {
                 let is_target = index == last_index;
-                // Intermediates are resolved only when the caller will dial
-                // them. Head does not — it hands its caller the target's
-                // address and the caller dials that directly — so an
-                // intermediate it never touches must not disqualify a route.
+                // `hop_role: None` skips intermediates entirely: they are
+                // neither resolved nor required to resolve, so a path is
+                // COLLAPSED TO ITS TARGET and the returned route dials that
+                // target directly. Only a caller that never touches the
+                // intermediate may ask for this — otherwise the route claims
+                // reachability the graph never asserted. A caller that
+                // establishes a chain along the path must pass `Some(role)`,
+                // as Fetch and Head both do, so an unresolvable intermediate
+                // disqualifies the route instead of silently disappearing
+                // from it.
                 let role = if is_target {
                     Some(target_role)
                 } else {
