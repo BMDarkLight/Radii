@@ -11,9 +11,15 @@
 
 //! The acceptance test for role-tagged addresses.
 //!
-//! One node advertises both a relay listener and an http backend in a single
-//! `NodeHello`. Fetch must resolve the relay address and Head the http one.
-//! Before roles, both read the same entry and one of them was always wrong.
+//! One node advertises two differently-tagged listeners in a single
+//! `NodeHello`, and a consumer asking for one role must get that role's
+//! address and never the other's. Before roles, both read the same entry and
+//! one of them was always wrong.
+//!
+//! The roles here are fixtures for the mechanism, not a picture of a
+//! deployment: in production both Fetch and Head resolve `relay`, and
+//! nothing resolves `http`. This test uses the two tags precisely because
+//! they must not be confusable.
 
 use radii_core::routing::{resolve_candidates, GraphSnapshot, Link, NodeId, ProtocolId, RoleId};
 use radii_integration::{bind_local, wait_ready};
@@ -77,7 +83,7 @@ async fn one_node_serves_both_consumers_from_one_hello() {
         latency_ms: Some(10),
     });
 
-    // Fetch's view: every hop over its relay listener.
+    // Asking for `relay` on every hop, as Fetch and Head both do.
     let fetch = resolve_candidates(
         &snapshot,
         &listen_addrs,
@@ -92,7 +98,11 @@ async fn one_node_serves_both_consumers_from_one_hello() {
     assert_eq!(fetch.len(), 1);
     assert_eq!(fetch[0].hops.last().unwrap().addr, "10.0.0.5:2224");
 
-    // Head's view: the target's http backend, no intermediates.
+    // Asking for a different role on the target, and skipping intermediates
+    // (`hop_role: None`), must select that role's address instead. Note what
+    // `None` costs: the path collapses to its target, so this shape is only
+    // correct for a caller that does not dial the intermediates it planned
+    // through.
     let head = resolve_candidates(
         &snapshot,
         &listen_addrs,

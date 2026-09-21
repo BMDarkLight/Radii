@@ -11,7 +11,10 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
 ## Today
 
 - HTTP listener with `GET /health`
-- Catch-all handler returns JSON: source IP, host, chosen backend, decision reason
+- Reverse proxy: the catch-all forwards to the decided backend and streams the
+  response back. `GET /_radii/decision` still returns the decision as JSON
+  (source IP, host, chosen backend, ranked candidates, decision reason), on
+  that one route rather than on every path
 - Decision engine, in priority order:
   1. **Graph route** (optional, `[graph]` config) — polls Crawl for its reachability graph on an interval and plans a route from Head's `source_node_id` to the node mapped to the request host in `node_map`; resolves to that node's registered listen address. Falls through if the host isn't mapped or no reachable route exists.
   2. **Host map** — static `routing.host_map` lookup.
@@ -21,8 +24,8 @@ cargo run -p radii-head -- --config crates/head/head.example.toml
 
 ## Next
 
-- Reverse-proxy HTTP to the selected backend
-- Authenticated control-plane surface
+- Authenticated control-plane surface (`/_radii/decision` is unauthenticated
+  and discloses the backend map — see [`SECURITY.md`](../../SECURITY.md))
 - Live config reload
 - HTTPS / SSH / DNS surfaces (deferred until the HTTP path is solid)
 
@@ -53,17 +56,40 @@ host-map and default fallbacks, and on the no-policy-matched sentinel alike —
 so existing consumers reading only `backend` are unaffected, and a consumer
 iterating `candidates` never has to special-case an empty list.
 
-**Head does not proxy**, so it cannot fail over itself — it returns a decision
-and the caller dials it. The `candidates` list is what lets that caller fail
-over, and it is the seam a future reverse proxy will read.
+Head proxies, so it fails over across this list itself — see
+[The retry boundary](#the-retry-boundary) for when it may and may not. The
+list is still reported in the decision JSON, which is now diagnostic rather
+than something a caller acts on.
 
 ### Address roles
 
-Head and Fetch read the same node registry, but each resolves a different
-role from a node's advertised addresses: Head resolves the `http` role for
-the backend it hands its callers, Fetch resolves the `relay` role for every
-hop it plans. A node that should serve both must advertise both, e.g.
-`--listen-addr relay=HOST:PORT --listen-addr http=HOST:PORT`.
+Head and Fetch read the same node registry and resolve the **same** role from
+it: `relay`, for **every hop of a path**, not just its last one. Head reaches
+a graph-resolved backend over a source-routed chain: it dials the first hop,
+hands it the tail, and speaks end-to-end with the target through it. Every
+node along the way is dialed by someone, so every node along the way needs
+one advertised address:
+
+```
+--listen-addr relay=HOST:PORT
+```
+
+A node that omits it is not merely unusable as a backend — it cannot be
+routed *through*, and any path crossing it is dropped as undialable. That is
+deliberate: Head cannot dial a hop it has no address for, and a route it
+cannot open should not be offered as a candidate.
+
+Nothing resolves the `http` role today. `radii_core::routing::RoleId::HTTP`
+still names the string, marked in its own doc comment as reserved and
+unresolved, because the role vocabulary is a free string on the wire and
+keeping the constant costs nothing. Advertising `http=HOST:PORT` is
+harmless but useless: Head will not find a `relay` address for that node,
+will drop the route as undialable, and will fall through to `routing.host_map`
+or `routing.default_backend` — silently, since an unreachable route is
+indistinguishable from a node that is simply down.
+
+A `role` is a claim, not a credential; see the residual risk of that in
+[`SECURITY.md`](../../SECURITY.md).
 
 ## Proxying
 

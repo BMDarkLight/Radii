@@ -27,15 +27,22 @@ source_node_id = "head"
 poll_interval_ms = 5000
 allowed_protocols = ["http"]
 max_hops = 4
-# How many ranked backends to report per host. Head does not proxy, so it
-# cannot fail over itself — the extras are reported so its caller can.
+# How many ranked backends to plan per host. Head proxies, so it fails over
+# across these itself when a chain will not open — the extras are what it
+# fails over to, not just what it reports.
 max_candidates = 3
 
-# A host may name several nodes. Head plans to all of them and reports the
+# A host may name several nodes. Head plans to all of them and tries the
 # reachable ones best-first. A bare string still works for a single node.
-# Every mapped node must advertise an `http`-role listen address (e.g.
-# `--listen-addr http=HOST:PORT`) — that is the address Head resolves and
-# hands to its callers.
+#
+# Every mapped node must advertise a `relay`-role listen address (e.g.
+# `--listen-addr relay=HOST:PORT`) — and so must every node a route to it
+# may cross. Head reaches a backend over a source-routed chain: it dials the
+# first hop, hands it the tail, and terminates at the target's relay
+# listener, so every hop needs a dialable address. A path crossing a node
+# that advertises none is dropped. Nothing resolves the `http` role; a node
+# advertising only `http=HOST:PORT` is silently skipped, and the request
+# falls through to host_map/default below.
 [graph.node_map]
 "example.com" = ["node-b", "node-c"]
 "single.example.com" = "node-b"

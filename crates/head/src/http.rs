@@ -42,8 +42,8 @@ struct HeadResponse {
     host: Option<String>,
     backend: String,
     /// Every reachable backend, best first, `backend` being the first.
-    /// Head does not proxy, so it cannot fail over itself — the list is
-    /// here so its caller can.
+    /// Head fails over across these itself when a chain will not open, so
+    /// the list is diagnostic — it shows what Head *would* try, in order.
     candidates: Vec<String>,
     decision_reason: String,
 }

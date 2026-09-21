@@ -63,9 +63,10 @@ async fn health_and_host_map_decision() {
     handle.abort();
 }
 
-/// Head reports every reachable backend for a host, best first, so a caller
-/// that dials them can fail over. Head does not proxy, so it cannot fail
-/// over itself — the list is the seam that lets its caller.
+/// Head plans every reachable backend for a host, best first, and reports
+/// them in the decision JSON. Head proxies, so it fails over across this
+/// list itself when a chain will not open; the JSON is the diagnostic view
+/// of what it would try, in order.
 #[tokio::test]
 async fn head_reports_ranked_candidates() {
     use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId};

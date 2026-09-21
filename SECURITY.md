@@ -129,7 +129,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Relayed status sanitisation | `radii-fetch` (`relay::KNOWN_ACK_STATUSES`) | A downstream hop's reply is relayed upstream, so only an `Ack` is ever forwarded and only with a status from a closed vocabulary; anything else becomes one fixed local code. Without this a compromised hop could push up to `MAX_FRAME_LEN` of arbitrary text — newlines, escapes — through every upstream node's logs |
 | End-to-end tunnel identity | `radii-fetch` (`chain::establish`) | Two nested TLS sessions authenticate different peers: the hop-local one authenticates the first relay dialed, the end-to-end one authenticates the final target. **This holds only when `[tunnel_tls]` identities are actually configured on the originating and terminal nodes.** Without them, `tls::connect_on`/`accept_on` fall back to plaintext and a relay carrying the chain sees cleartext, not ciphertext — Fetch warns at startup when `[graph]` is configured without `[tunnel_tls.upstream]` (`config::graph_without_e2e_tls_warning`) |
 | Upstream node verification | `radii-fetch`, `radii-proto` (`tls::dial_expecting`) | When Fetch dials a graph-resolved upstream over mTLS, the peer's certificate CN must match the node id the route was planned to — a poisoned `listen_addrs` cannot silently redirect the tunnel to another CA-issued host |
-| Role-tagged listen addresses | `radii-proto` (`ListenAddr`), `radii-core` (`RoleId`) | Each advertised address carries the role it serves, so Fetch resolves `relay` listeners and Head `http` backends from one registry entry without either reading the other's address. Decode bounds the list (`MAX_LISTEN_ADDRS` = 16) and each string (`MAX_LISTEN_ADDR_LEN` = 256, `MAX_ROLE_LEN` = 64), closing a previously unbounded growth path into Crawl's registry |
+| Role-tagged listen addresses | `radii-proto` (`ListenAddr`), `radii-core` (`RoleId`) | Each advertised address carries the role it serves, so one registry entry can describe several listeners without a consumer reading the wrong one. Only `relay` is resolved today — by Fetch for every hop it plans, and by Head for the backend it proxies to, since a chain terminates at the target's relay listener either way. Decode bounds the list (`MAX_LISTEN_ADDRS` = 16) and each string (`MAX_LISTEN_ADDR_LEN` = 256, `MAX_ROLE_LEN` = 64), closing a previously unbounded growth path into Crawl's registry |
 | Proxy hop-by-hop header stripping | `radii-head` (`proxy::strip_hop_by_hop`) | Head removes `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and every header *named in* the message's own `Connection` header, in both directions. The `Connection`-named set is collected before anything is removed, since dropping `Connection` first would lose the list of what else to drop — forwarding such a header to a backend is request-smuggling surface |
 | Proxy timeouts | `radii-head` (`[http]`) | `attempt_timeout_ms` bounds one candidate's connection setup (chain establishment plus HTTP handshake); `response_timeout_ms` bounds waiting for response headers. Body streaming is deliberately unbounded — a slow large download is legitimate, and capping it would break the case streaming exists to serve |
 
@@ -146,12 +146,12 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | Relays observe traffic patterns | Payloads are opaque to a relay, but it sees volume, timing, and its immediate neighbours. There is no padding and no cover traffic — **this is not anonymity** and must not be described as such |
 | A relay can deny service to a chain it carries | It can stall or drop. It cannot read or impersonate the endpoint. Ranked-candidate retry is the mitigation, not prevention |
 | Retry stops at the end-to-end handshake | Once application bytes flow, TCP offers no way to migrate a stream, so a mid-stream failure reaches the client as a closed connection rather than being retried onto another candidate |
-| An address role is a claim, not a credential | A node advertising `role = "relay"` may run nothing there: the chain fails at dial, the candidate is discarded, and retry moves on — bounded by `attempt_timeout_ms`. A false `role = "http"` is weaker, because Head does not dial and so cannot verify; its caller discovers the lie. Not a new exposure — Head hands out unverified addresses today — but a role tag makes a claim more *specific* without making it more *trustworthy* |
+| An address role is a claim, not a credential | A node advertising `role = "relay"` may run nothing there: the chain fails at dial, the candidate is discarded, and retry moves on — bounded by `attempt_timeout_ms`. Since both Fetch and Head now dial the role they resolve, a false claim is discovered at handshake rather than by a downstream consumer, and `dial_expecting` additionally checks the peer's certificate CN against the node id the route was planned to. A role tag still makes a claim more *specific* without making it more *trustworthy* — it is verified by connecting, not by being advertised |
 | `X-Forwarded-For` is recorded, not trusted | Head appends the immediate peer to any inbound value, but any client can send one. Head makes no access-control decision on it, and nothing downstream should treat it as authenticated — it is provenance for a log, not a credential |
 | Head is now a data path | A wrong decision used to print a wrong address; it now delivers user traffic to the wrong backend. The end-to-end TLS session inside a chain authenticates the target node, so a relay carrying it can neither read nor impersonate the endpoint — but the consequence of a routing mistake has changed in kind |
 | Head retries only before the request is sent | A candidate is retried only when its chain failed to establish, so the request was never delivered. Once written, a failure reaches the client as 502 — Head cannot know whether the backend processed it, and replaying could duplicate a POST |
 | No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch, TLS-authenticated or not |
-| Unbounded graph state | Crawl's reachability log only ever grows, and route planning over a dense graph is super-linear — a peer permitted to report can drive memory and CPU up with a modest number of messages |
+| Graph state is bounded, but the bounds are the only defence | Crawl's reachability table is keyed (a repeat report replaces rather than appends), capped globally (`MAX_REACHABILITY_ENTRIES` = 16384) and per peer (`MAX_REACHABILITY_ENTRIES_PER_PEER` = 1024), and aged out by `node_ttl_ms`; planning is capped by `MAX_GRAPH_NODES` / `MAX_GRAPH_LINKS` / `MAX_ROUTE_HOPS` / `MAX_ROUTE_RESULTS`. So a reporting peer can no longer drive memory or CPU without limit. It can still fill its own per-peer share with invented targets, and a graph truncated at a cap means every planner works from a partial view — `GraphSnapshot::dropped_links()` is non-zero when that happens and Head logs it |
 | Fetch is an open TCP tunnel to configured upstream | Misbind + exposure ≈ proxy to internal services |
 | No sandboxing of protocol workers | A memory-safety bug would be process-wide (Rust reduces but does not eliminate risk) |
 | Logs may include client IPs and hosts | Privacy / compliance exposure |
@@ -177,18 +177,24 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 Graph-resolved traffic is delivered over the relay protocol. **Even a one-hop
 route terminates at the target's relay listener**, which then splices to that
 node's own configured `upstream` — there is no raw-dial shortcut for short
-routes. A node advertises its relay listener and its HTTP backend as
-separate role-tagged entries in `listen_addrs`: Fetch resolves the `relay`
-one for every hop it plans, Head resolves the `http` one for the backend it
-hands its callers, and the two no longer share one ambiguous address.
+routes. `listen_addrs` entries are role-tagged so one registry entry can
+describe several listeners, but **only the `relay` role is resolved**: Fetch
+resolves it for every hop it plans, and Head resolves it for the backend it
+proxies to, because a Head-originated chain terminates at that same relay
+listener. The `http` role is reserved and unresolved — see the residual-risk
+note on role claims below.
 
 Two consequences, and both are operator-visible:
 
-- [ ] Advertise each listener with its role: `--listen-addr relay=HOST:PORT`
-      for a node that carries chains, `--listen-addr http=HOST:PORT` for one
-      Head should hand out as a backend. A node advertising no `relay`
-      address is simply never selected as a Fetch route target — wrong
+- [ ] Advertise every listener that must be reachable with
+      `--listen-addr relay=HOST:PORT` — on every node a path may cross, not
+      only on the ones that terminate a chain. A node advertising no `relay`
+      address is never selected as a route target *or* as an intermediate
+      hop, by Fetch or by Head, and any path crossing it is dropped: wrong
       configuration means *not chosen* rather than *chosen and corrupting*.
+      It fails silently, though: an unresolvable route is indistinguishable
+      from a node that is down, and Head falls through to its static
+      `routing.host_map` / `routing.default_backend`.
 - [ ] **A node that terminates chains must configure `[tunnel_tls.listener]`.**
       The end-to-end session is the only thing authenticating an originator
       once chains exceed one hop — at length one the originator is the peer the
@@ -257,7 +263,7 @@ Fetch copies bytes between accepted clients and a configured upstream. If the li
 
 ### Head information disclosure
 
-Head’s non-health HTTP responses currently return JSON describing the selected backend. That can leak internal hostnames and topology. Disable public exposure or front with auth until proxy mode + auth ship.
+Proxy mode has shipped: Head’s non-health responses are now the backend’s own, not a decision document. The decision JSON survives at one route, `GET /_radii/decision`, which still reports the selected backend and every ranked candidate address for the requested host — internal hostnames and topology, to anyone who can reach it. It is unauthenticated. Firewall that route, or keep Head off the public internet, until authentication ships.
 
 ---
 
