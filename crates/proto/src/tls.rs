@@ -132,8 +132,46 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 /// from a `host:port` (or bare host/IP) address string. Certificates for
 /// IP-addressed nodes must carry a matching IP SAN.
 fn server_name_for_addr(addr: &str) -> Result<ServerName<'static>> {
-    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
-    ServerName::try_from(host.to_string()).context("invalid TLS server name")
+    ServerName::try_from(host_of(addr).to_string())
+        .with_context(|| format!("invalid TLS server name in address {addr:?}"))
+}
+
+/// The host part of an address, in every spelling a node can advertise.
+///
+/// Splitting on the last colon is only correct for IPv4 and DNS names. An
+/// IPv6 address is *made of* colons, so the naive split turned
+/// `[::1]:7100` into `[::1]` and a bare `::1` into `:` — neither of which
+/// is a server name, so every mTLS dial to a v6-addressed node failed with
+/// "invalid TLS server name". Plaintext was unaffected, because
+/// `TcpStream::connect` parses the bracketed form itself: the *secure*
+/// configuration was the broken one, which is the wrong way round for a
+/// runtime whose whole premise is reaching nodes across churning networks.
+///
+/// Three shapes, checked in the order that makes each unambiguous:
+///
+/// - Bracketed (`[::1]`, `[::1]:7100`) — the brackets exist precisely to
+///   mark where the address ends, so trust them and ignore any port.
+/// - Unbracketed with more than one colon (`::1`, `2001:db8::1`) — a bare
+///   v6 literal. There is no port to strip: `::1:7100` is a valid address
+///   in its own right, so guessing otherwise would silently rewrite it.
+/// - Anything else (`127.0.0.1:7100`, `node-b.example:7100`, `host`) — at
+///   most one colon, which can only be a port separator.
+///
+/// A malformed address is returned unchanged rather than repaired, so
+/// `ServerName::try_from` rejects it with the original text in the error.
+/// Zone-scoped literals (`fe80::1%eth0`) are not supported: the zone is
+/// local to the sending host and cannot appear in a peer's certificate.
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((host, _)) => host,
+            None => addr,
+        };
+    }
+    if addr.matches(':').count() > 1 {
+        return addr;
+    }
+    addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr)
 }
 
 /// Extracts the Subject Common Name from a peer's leaf certificate, used as
@@ -319,6 +357,12 @@ mod tests {
             .push(DnType::CommonName, common_name);
         params.subject_alt_names = vec![
             SanType::IpAddress("127.0.0.1".parse().unwrap()),
+            // The v6 loopback, so a test can dial `[::1]:port` and have the
+            // certificate actually match. rustls verifies an IP-addressed
+            // peer against its IP SANs (it sends no SNI for one), so without
+            // this the v6 handshake would fail on the certificate rather
+            // than on the name parsing the test is there to exercise.
+            SanType::IpAddress("::1".parse().unwrap()),
             SanType::DnsName(Ia5String::try_from("localhost").unwrap()),
         ];
         let key = KeyPair::generate().unwrap();
@@ -379,6 +423,92 @@ mod tests {
             node_b,
             outsider,
         }
+    }
+
+    /// Every spelling a node can advertise in `listen_addrs`, and the host a
+    /// certificate must therefore be checked against.
+    ///
+    /// The IPv6 rows are the regression. Splitting on the last colon made
+    /// `[::1]:7100` into `[::1]` and a bare `::1` into `:`, so
+    /// `ServerName::try_from` rejected both and every mTLS dial to a
+    /// v6-addressed node failed with "invalid TLS server name" — while the
+    /// same mesh worked in plaintext, because `TcpStream::connect` parses
+    /// the bracketed form itself.
+    #[test]
+    fn resolves_the_server_name_for_every_address_shape() {
+        for (addr, expected) in [
+            ("127.0.0.1:7100", "127.0.0.1"),
+            ("node-b.example:7100", "node-b.example"),
+            ("node-b.example", "node-b.example"),
+            ("[::1]:7100", "::1"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("[::1]", "::1"),
+            ("::1", "::1"),
+            ("2001:db8::1", "2001:db8::1"),
+        ] {
+            assert_eq!(host_of(addr), expected, "host_of({addr:?})");
+            server_name_for_addr(addr)
+                .unwrap_or_else(|err| panic!("{addr:?} must resolve to a server name: {err}"));
+        }
+    }
+
+    /// A malformed address is rejected, not silently repaired into a name
+    /// that would be checked against the wrong certificate. The error names
+    /// the original text so an operator can find it in their registry.
+    #[test]
+    fn rejects_a_malformed_address_rather_than_guessing() {
+        for addr in ["[::1", "[", "fe80::1%eth0"] {
+            let err = server_name_for_addr(addr)
+                .expect_err("a malformed address must not produce a server name");
+            assert!(
+                err.to_string().contains(addr),
+                "the error must quote the offending address, got: {err}"
+            );
+        }
+    }
+
+    /// The end of the fix that the string test cannot reach: a real mutual
+    /// TLS handshake to a v6 literal, verified against the certificate's
+    /// `::1` IP SAN.
+    ///
+    /// Skipped where the host has no v6 loopback to bind. The test above is
+    /// the unconditional guard for the regression itself; this one proves
+    /// the whole dial path works, so losing it on a v4-only host costs
+    /// coverage of the integration, not of the bug.
+    #[tokio::test]
+    async fn authenticates_a_peer_reached_at_an_ipv6_literal() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipping: no IPv6 loopback on this host");
+            return;
+        };
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(
+            addr.starts_with('['),
+            "expected a bracketed v6 addr: {addr}"
+        );
+
+        let pki = test_pki();
+        let server_identity = TlsIdentity::load(&pki.node_a).unwrap();
+        let client_identity_cfg = TlsIdentity::load(&pki.node_b).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut tls_stream, peer) = accept(stream, Some(&server_identity)).await.unwrap();
+            let mut buf = [0u8; 5];
+            tls_stream.read_exact(&mut buf).await.unwrap();
+            (peer, buf)
+        });
+
+        // `dial_expecting` rather than `dial`: the node-id check is the
+        // reason the server name has to be right in the first place.
+        let mut client = dial_expecting(&addr, Some(&client_identity_cfg), Some("node-a"))
+            .await
+            .expect("an mTLS dial to a v6 literal must succeed");
+        client.write_all(b"hello").await.unwrap();
+
+        let (peer, buf) = server.await.unwrap();
+        assert_eq!(peer.as_deref(), Some("node-b"));
+        assert_eq!(&buf, b"hello");
     }
 
     #[tokio::test]

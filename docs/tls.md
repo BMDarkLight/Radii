@@ -31,7 +31,7 @@ When a section is absent, that connection stays plaintext — today's default, u
 scripts/gen-dev-certs.sh ./certs crawl head fetch
 ```
 
-This generates a throwaway CA (`./certs/ca.cert.pem` + `ca.key.pem`) and one Ed25519 leaf certificate per node id you pass, each signed by that CA with `DNS:localhost`, `DNS:<node-id>`, and `IP:127.0.0.1` as Subject Alternative Names (SANs). Point each compartment's `[tls]` section at the resulting files:
+This generates a throwaway CA (`./certs/ca.cert.pem` + `ca.key.pem`) and one Ed25519 leaf certificate per node id you pass, each signed by that CA with `DNS:localhost`, `DNS:<node-id>`, `IP:127.0.0.1`, and `IP:::1` as Subject Alternative Names (SANs). Both loopback addresses are covered so a node advertised as `[::1]:PORT` verifies locally: rustls sends no SNI for an IP-addressed peer and checks the IP SANs instead, so a v6 address with only the v4 SAN present fails the handshake on the certificate. Point each compartment's `[tls]` section at the resulting files:
 
 ```toml
 [tls]

@@ -20,6 +20,14 @@
 
 set -euo pipefail
 
+# Git Bash / MSYS on Windows rewrites any argument that looks like a POSIX
+# path into a Windows one, which mangles every `-subj "/CN=..."` below into
+# something like `C:/Program Files/Git/CN=Radii Dev CA` — openssl then
+# rejects the subject and the script fails at the CA step. Both variables
+# are inert on Linux and macOS, where nothing reads them.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
+
 if ! command -v openssl >/dev/null 2>&1; then
   echo "error: openssl is required but was not found on PATH" >&2
   exit 1
@@ -61,8 +69,13 @@ for node_id in "${node_ids[@]}"; do
   fi
 
   echo "Generating leaf certificate for '$node_id'"
+  # IP:::1 is the v6 loopback, so a node advertised as `[::1]:PORT` verifies
+  # locally. rustls sends no SNI for an IP-addressed peer and checks it
+  # against the certificate's IP SANs instead, so without this entry a v6
+  # dial fails on the certificate rather than on the address — which looks
+  # identical to the name-parsing bug this SAN exists to let you test past.
   cat > "$ext" <<EOF
-subjectAltName = DNS:localhost, DNS:$node_id, IP:127.0.0.1
+subjectAltName = DNS:localhost, DNS:$node_id, IP:127.0.0.1, IP:::1
 EOF
 
   openssl req -newkey ed25519 -noenc \
