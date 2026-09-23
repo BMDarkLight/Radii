@@ -563,8 +563,10 @@ async fn forward(
 /// direction mid-flight and dropped the entire response on the floor;
 /// `pump` already shuts down the peer's write side when it reaches EOF, so
 /// each direction terminates on its own and waiting for both is what lets a
-/// half-close mean what it means. `server::handle_connection` splices with
-/// `try_join!` for exactly this reason, and the two paths now agree.
+/// half-close mean what it means. `server::handle_connection` splices the
+/// plain tunnel with `copy_bidirectional`, which shuts the peer's write side
+/// down on EOF and likewise returns only once both directions are finished,
+/// so the two paths agree on both halves of this.
 ///
 /// "Idle" is deliberately a property of the chain, not of one direction. A
 /// legitimate tunnel is often quiet one way for a long time — a shell session

@@ -246,13 +246,25 @@ async fn connect_upstream(
     }
 }
 
-async fn handle_connection(inbound: BoxedStream, outbound: BoxedStream) -> anyhow::Result<()> {
-    let (mut ri, mut wi) = tokio::io::split(inbound);
-    let (mut ro, mut wo) = tokio::io::split(outbound);
-
-    let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-    let server_to_client = tokio::io::copy(&mut ro, &mut wi);
-    tokio::try_join!(client_to_server, server_to_client)?;
+/// Splices the tunnel until both directions are done.
+///
+/// `copy_bidirectional` rather than a pair of `tokio::io::copy` futures:
+/// `copy` flushes the writer at EOF but never shuts it down, so a client
+/// that finished sending and half-closed had its FIN stop here instead of
+/// reaching the upstream. An upstream that reads to EOF before answering —
+/// HTTP/1.0, `curl --http1.0`, an SSH session closing stdin — then waited
+/// forever for a FIN that had already been sent. `copy_bidirectional` shuts
+/// the peer's write side down on EOF, which is what makes a half-close mean
+/// what it means, and still returns only once *both* directions have
+/// finished, so the response is never cancelled mid-flight.
+///
+/// This is the same property `relay::pump` provides for a chain; the two
+/// paths agree on it now.
+async fn handle_connection(
+    mut inbound: BoxedStream,
+    mut outbound: BoxedStream,
+) -> anyhow::Result<()> {
+    tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
 
     Ok(())
 }

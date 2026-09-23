@@ -15,9 +15,11 @@
 //! The relay splice used to return as soon as *either* direction saw EOF,
 //! which cancelled the other direction mid-flight. A half-close — HTTP/1.0,
 //! `curl --http1.0`, an SSH session closing stdin — therefore discarded the
-//! entire response. `fetch::server::handle_connection` splices the plain
-//! tunnel with `try_join!` and never had the bug; the relay path, which is
-//! what actually carries chains, did.
+//! entire response.
+//!
+//! The plain tunnel had the mirror-image bug — it waited for both directions
+//! but never shut a write side down on EOF, so a half-close hung instead of
+//! truncating. See `fetch_tunnel_half_close.rs`; both paths are covered now.
 
 use radii_integration::pki::TestCa;
 use radii_integration::{bind_local, wait_ready};
