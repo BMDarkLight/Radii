@@ -193,6 +193,45 @@ pub fn banner(term: &Term, version: &str) -> Option<String> {
     }
 }
 
+/// How a command should render its result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    /// `--json`: one JSON document, for anything parsing us on purpose.
+    Json,
+    /// Piped without `--json`: stable `key=value` lines. Scripts already
+    /// depend on these, so they never change shape for cosmetic reasons.
+    Plain,
+    /// A terminal a human is reading: aligned columns, glyphs, colour.
+    Pretty,
+}
+
+pub fn format(term: &Term, json: bool) -> Format {
+    if json {
+        Format::Json
+    } else if term.stdout_is_tty {
+        Format::Pretty
+    } else {
+        Format::Plain
+    }
+}
+
+/// The glyph for a reachability state, in the colour that state always takes.
+///
+/// `None` is *unprobed* — a node the graph knows of but holds no observation
+/// for, which is a different thing from one observed to be unreachable.
+pub fn reach_glyph(reachable: Option<bool>, term: &Term) -> String {
+    match reachable {
+        Some(true) => tinted("\u{25cf}", REACH, term),
+        Some(false) => tinted("\u{25d0}", SEVERED, term),
+        None => tinted("\u{25cb}", UNKNOWN, term),
+    }
+}
+
+/// Dim text — units, absent values, anything the eye should skip.
+pub fn dim(text: &str, term: &Term) -> String {
+    tinted(text, UNKNOWN, term)
+}
+
 /// A section heading, matching clap's own help headings.
 pub fn heading(text: &str, term: &Term) -> String {
     if !term.color() {

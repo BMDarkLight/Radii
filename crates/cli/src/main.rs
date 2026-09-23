@@ -10,6 +10,8 @@
 // additional terms.
 
 mod brand;
+mod graph;
+mod head;
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -27,7 +29,11 @@ use std::path::PathBuf;
 /// the whole project is organised around.
 ///
 /// `every_command_is_grouped` keeps this honest when a command is added.
-const GROUPS: &[(&str, &[&str])] = &[("Discovery", &["hello", "report"]), ("Routing", &["plan"])];
+const GROUPS: &[(&str, &[&str])] = &[
+    ("Discovery", &["hello", "report", "graph"]),
+    ("Routing", &["plan"]),
+    ("Control plane", &["health", "decision"]),
+];
 
 #[derive(Parser)]
 #[command(
@@ -163,7 +169,17 @@ enum Commands {
         #[command(flatten)]
         tls: TlsArgs,
     },
-    /// Plan ranked routes from JSONL reachability reports on stdin
+    /// Read Crawl's node registry and reachability graph
+    Graph {
+        #[arg(long)]
+        addr: String,
+        /// Emit one JSON document instead of a table.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        tls: TlsArgs,
+    },
+    /// Plan ranked routes, from a live Crawl or from JSONL on stdin
     Plan {
         #[arg(long)]
         source: String,
@@ -175,6 +191,32 @@ enum Commands {
         max_hops: usize,
         #[arg(long, default_value_t = 3)]
         limit: usize,
+        /// Plan against this Crawl's graph. Without it, reports are read as
+        /// JSONL on stdin.
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        tls: TlsArgs,
+    },
+    /// Check a Head's status and how fresh its graph is
+    Health {
+        /// Head's base URL. A bare host:port gets http:// filled in.
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a Head where a host would go, and what it would fail over to
+    Decision {
+        #[arg(long)]
+        url: String,
+        /// The Host header to decide on.
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -215,13 +257,29 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Graph { addr, json, tls } => {
+            let tls = tls.load()?;
+            graph::run(&addr, tls.as_ref(), json, &term).await
+        }
         Commands::Plan {
             source,
             target,
             protocols,
             max_hops,
             limit,
-        } => plan_routes(source, target, protocols, max_hops, limit, &term),
+            addr,
+            json,
+            tls,
+        } => {
+            plan_routes(
+                source, target, protocols, max_hops, limit, addr, json, tls, &term,
+            )
+            .await
+        }
+        Commands::Health { url, json } => head::health(&url, json, &term).await,
+        Commands::Decision { url, host, json } => {
+            head::decision(&url, host.as_deref(), json, &term).await
+        }
     }
 }
 
@@ -306,26 +364,54 @@ fn print_reply(message: RadiiMessage) {
     }
 }
 
-fn plan_routes(
+/// Plans over a graph taken either from a live Crawl or from JSONL on stdin.
+///
+/// The stdin path is the offline planner the CLI has always had; `--addr`
+/// plans against what Crawl actually holds, which is the same view Head and
+/// Fetch route on.
+#[allow(clippy::too_many_arguments)]
+async fn plan_routes(
     source: String,
     target: String,
     protocols: Vec<String>,
     max_hops: usize,
     limit: usize,
+    addr: Option<String>,
+    json: bool,
+    tls: TlsArgs,
     term: &brand::Term,
 ) -> Result<()> {
-    let mut reports = Vec::new();
-    let stdin = stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    let snapshot = match addr {
+        Some(addr) => {
+            let tls = tls.load()?;
+            let (_nodes, reports) = graph::fetch(&addr, tls.as_ref()).await?;
+            graph::to_snapshot(&reports)
         }
-        let report: ReachabilityReport = serde_json::from_str(&line)?;
-        reports.push(report);
+        None => {
+            let mut reports = Vec::new();
+            let stdin = stdin();
+            for line in stdin.lock().lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let report: ReachabilityReport = serde_json::from_str(&line)?;
+                reports.push(report);
+            }
+            GraphSnapshot::from_reports(reports)
+        }
+    };
+
+    // A snapshot at its size cap drops links rather than growing without
+    // bound, so a plan made from one is partial. Say so on stderr, which
+    // leaves stdout parseable.
+    if snapshot.dropped_links() > 0 {
+        eprintln!(
+            "warning: the graph exceeded the local size cap; {} link(s) dropped, planning from a partial view",
+            snapshot.dropped_links()
+        );
     }
 
-    let snapshot = GraphSnapshot::from_reports(reports);
     let allowed = protocols
         .into_iter()
         .map(ProtocolId::new)
@@ -340,26 +426,47 @@ fn plan_routes(
     let planner = RoutePlanner::new(DefaultScorer);
     let results = planner.plan(&snapshot, &request, limit);
 
-    // Only a terminal a human is reading gets the table. Anything piped keeps
-    // the original key=value line, because something out there is parsing it.
-    for (rank, route) in results.iter().enumerate() {
-        let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
-        if term.stdout_is_tty {
-            println!(
-                "{} {:>2}  {:>6.1}  {:<8}  {}",
-                brand::tinted("\u{25cf}", brand::REACH, term),
-                rank + 1,
-                route.score,
-                route.protocol.0,
-                names.join(" \u{2192} "),
-            );
-        } else {
-            println!(
-                "score={:.1} protocol={} path={}",
-                route.score,
-                route.protocol.0,
-                names.join(" -> ")
-            );
+    match brand::format(term, json) {
+        brand::Format::Json => {
+            let routes = results
+                .iter()
+                .map(|route| {
+                    serde_json::json!({
+                        "score": route.score,
+                        "protocol": route.protocol.0,
+                        "path": route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::json!({ "routes": routes }));
+        }
+        // The original key=value line, unchanged: something out there parses it.
+        brand::Format::Plain => {
+            for route in &results {
+                let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
+                println!(
+                    "score={:.1} protocol={} path={}",
+                    route.score,
+                    route.protocol.0,
+                    names.join(" -> ")
+                );
+            }
+        }
+        brand::Format::Pretty => {
+            if results.is_empty() {
+                println!("{}", brand::dim("no route", term));
+            }
+            for (rank, route) in results.iter().enumerate() {
+                let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
+                println!(
+                    "{} {:>2}  {:>6.1}  {:<8}  {}",
+                    brand::reach_glyph(Some(true), term),
+                    rank + 1,
+                    route.score,
+                    route.protocol.0,
+                    names.join(" \u{2192} "),
+                );
+            }
         }
     }
 

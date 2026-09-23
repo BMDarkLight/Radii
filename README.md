@@ -97,7 +97,16 @@ cargo run -p radii-cli -- report --addr 127.0.0.1:7100 \
   --from node-a --target node-b --protocol radii --reachable true --rtt-ms 42
 ```
 
-Against a `[tls]`-enabled Crawl/Head, add `--tls-cert`, `--tls-key`, and `--tls-ca` to `hello`/`report` — see [`docs/tls.md`](docs/tls.md).
+Read the graph back, plan over it, and ask Head where a host would go:
+
+```bash
+cargo run -p radii-cli -- graph --addr 127.0.0.1:7100
+cargo run -p radii-cli -- plan --addr 127.0.0.1:7100 --source node-a --target node-b --protocols radii
+cargo run -p radii-cli -- health --url localhost:8080
+cargo run -p radii-cli -- decision --url localhost:8080 --host example.com
+```
+
+Against a `[tls]`-enabled Crawl/Head, add `--tls-cert`, `--tls-key`, and `--tls-ca` to `hello`, `report`, `graph` and `plan --addr` — see [`docs/tls.md`](docs/tls.md).
 
 The CLI's `hello` command only sends one `NodeHello`; a real participant needs to repeat it periodically (well under Crawl's default 60s liveness TTL, `node_ttl_ms`) to stay live in Crawl's registry.
 
@@ -115,7 +124,7 @@ printf '%s\n' \
 - **Crawl:** accepts `NodeHello`, probes, and reports over the Radii TCP protocol; keeps an in-memory view; acknowledges messages. Advertised node addresses are role-tagged, so a single registry entry can describe several listeners. Both Fetch and Head resolve the `relay` role — a chain terminates at the target's relay listener, whichever of them opened it — so a node that should be reachable needs `--listen-addr relay=HOST:PORT`. No other role is resolved today.
 - **Head:** a reverse proxy. It forwards HTTP requests to the backend it decides on and streams the response back, reaching graph-resolved backends over source-routed relay chains and failing over across ranked candidates when a chain will not open. `/health` and `/_radii/decision` are answered locally; everything else is proxied. Statically configured backends (host map, default) are dialed directly, since they carry no node identity. A fresh chain per request is a known limitation — see [`crates/head/README.md`](crates/head/README.md). Optional Radii listener that forwards to Crawl.
 - **Fetch:** TCP tunnel from `bind` to an upstream, reached either directly or over a source-routed chain of relays. Routes come from Crawl's reachability graph as a ranked candidate list spanning several paths *and* several target nodes; a failed candidate falls over to the next, and an exhausted list falls back to the static `upstream` (`ssh://` / `tcp://` prefixes stripped). When both the originating and terminal nodes have `[tunnel_tls]` identities configured, relays carry end-to-end-encrypted bytes they cannot read; without those identities the end-to-end layer falls back to plaintext and a carrying relay can read it. Relaying is opt-in per node (`[relay]`), requires mutual TLS, and is bounded by per-peer and global concurrency caps, a handshake deadline, and an idle deadline.
-- **core/cli:** graph snapshot + route planner; CLI hello/report/plan.
+- **core/cli:** graph snapshot + route planner. The `radii` CLI now covers all three compartments: `hello`/`report`/`graph` against Crawl — `graph` reads the registry and reachability graph back out, marking each node reachable, severed or unprobed — `plan` against either a live Crawl (`--addr`) or JSONL on stdin, and `health`/`decision` against a Head. Output is a table on a terminal, stable `key=value` lines when piped, or `--json`.
 - **Security:** opt-in mutual TLS (peer authentication + transport encryption + route authorization) for the Radii protocol and Fetch's tunnel data path; mandatory mutual TLS on the relay listener, with admission by CA membership (narrowable via `allow_peers`) and enforced resource bounds — see [`docs/tls.md`](docs/tls.md) and [`SECURITY.md`](SECURITY.md).
 
 ## Configuration
