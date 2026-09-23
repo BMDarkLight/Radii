@@ -411,8 +411,20 @@ async fn handle_connection(
             }
             RadiiMessage::GraphQuery => {
                 let guard = state.read().await;
-                let (nodes, reports) = graph_snapshot(&guard, now_unix_ms());
+                let (nodes, reports, dropped) = graph_snapshot(&guard, now_unix_ms());
                 drop(guard);
+                if dropped > 0 {
+                    // The snapshot no longer fits one frame. Answering with a
+                    // partial view keeps the mesh routing; answering with
+                    // nothing is what used to happen, and it took every Head
+                    // and Fetch poller down with it.
+                    tracing::warn!(
+                        source = %addr,
+                        dropped,
+                        "crawl graph snapshot truncated to fit the frame limit; \
+                         peers are routing from a partial view"
+                    );
+                }
                 tracing::info!(source = %addr, "crawl graph query");
                 write_message(&mut stream, &RadiiMessage::GraphSnapshot { nodes, reports }).await?;
             }
@@ -542,43 +554,75 @@ fn expired_node_ids(
 /// matches today's behavior, where reachability doesn't require prior
 /// registration (see `graph_routing.rs` in `crates/integration`, where
 /// `head` reports reachability without ever sending its own hello).
-fn graph_snapshot(state: &CrawlState, now_unix_ms: u64) -> (Vec<NodeInfo>, Vec<GraphReport>) {
+fn graph_snapshot(
+    state: &CrawlState,
+    now_unix_ms: u64,
+) -> (Vec<NodeInfo>, Vec<GraphReport>, usize) {
     let expired = expired_node_ids(&state.nodes, state.node_ttl_ms, now_unix_ms);
 
-    let nodes = state
-        .nodes
-        .iter()
-        .filter(|(node_id, _)| !expired.contains(*node_id))
-        .map(|(node_id, entry)| NodeInfo {
+    // Filled against a byte budget, not just a count. The per-peer and
+    // global entry caps bound how MANY observations a peer may hold, never
+    // how large each one is — `target` and `protocol` are peer-chosen
+    // strings that `authorized()` does not constrain even on an mTLS
+    // listener. Without a budget here, one peer staying inside every cap
+    // could push this past `MAX_FRAME_LEN`, `write_message` would refuse the
+    // frame, and every `GraphQuery` in the mesh failed for as long as those
+    // entries lived. A partial view keeps peers routing; no view at all does
+    // not, so overflow truncates and reports the count rather than failing.
+    let mut budget = radii_proto::SNAPSHOT_BUDGET as usize;
+    let mut dropped = 0usize;
+
+    // Nodes are filled first: a report naming a node nobody can resolve an
+    // address for is not actionable, so the registry is the more valuable
+    // half of a truncated snapshot.
+    let mut nodes = Vec::new();
+    for (node_id, entry) in state.nodes.iter() {
+        if expired.contains(node_id) {
+            continue;
+        }
+        let node = NodeInfo {
             node_id: node_id.clone(),
             listen_addrs: entry.listen_addrs.clone(),
             roles: entry.roles.clone(),
-        })
-        .collect();
+        };
+        let cost = radii_proto::node_info_encoded_bound(&node);
+        if cost > budget {
+            dropped += 1;
+            continue;
+        }
+        budget -= cost;
+        nodes.push(node);
+    }
 
-    let reports = state
-        .reachability
-        .iter()
-        .filter(|((from, target, _), entry)| {
-            // Drop an observation if either endpoint has gone quiet, or if the
-            // observation itself is stale — a peer that stopped probing should
-            // not keep a link alive in the graph indefinitely.
-            let endpoint_expired = expired.contains(from) || expired.contains(target);
-            let report_expired = state
-                .node_ttl_ms
-                .is_some_and(|ttl| now_unix_ms.saturating_sub(entry.last_seen_unix_ms) > ttl);
-            !endpoint_expired && !report_expired
-        })
-        .map(|((from, target, protocol), entry)| GraphReport {
+    let mut reports = Vec::new();
+    for ((from, target, protocol), entry) in state.reachability.iter() {
+        // Drop an observation if either endpoint has gone quiet, or if the
+        // observation itself is stale — a peer that stopped probing should
+        // not keep a link alive in the graph indefinitely.
+        let endpoint_expired = expired.contains(from) || expired.contains(target);
+        let report_expired = state
+            .node_ttl_ms
+            .is_some_and(|ttl| now_unix_ms.saturating_sub(entry.last_seen_unix_ms) > ttl);
+        if endpoint_expired || report_expired {
+            continue;
+        }
+        let report = GraphReport {
             from: from.clone(),
             target: target.clone(),
             protocol: protocol.clone(),
             reachable: entry.reachable,
             rtt_ms: entry.rtt_ms,
-        })
-        .collect();
+        };
+        let cost = radii_proto::graph_report_encoded_bound(&report);
+        if cost > budget {
+            dropped += 1;
+            continue;
+        }
+        budget -= cost;
+        reports.push(report);
+    }
 
-    (nodes, reports)
+    (nodes, reports, dropped)
 }
 
 #[cfg(test)]
@@ -628,7 +672,7 @@ mod tests {
         state
             .nodes
             .insert("wave-a".to_string(), entry(vec!["wave"], 0));
-        let (nodes, _) = graph_snapshot(&state, 0);
+        let (nodes, _, _) = graph_snapshot(&state, 0);
         let node = nodes.iter().find(|n| n.node_id == "wave-a").unwrap();
         assert_eq!(node.roles, vec!["wave".to_string()]);
     }
@@ -648,7 +692,7 @@ mod tests {
             report_entry(10_000),
         );
 
-        let (nodes, reports) = graph_snapshot(&state, 10_000);
+        let (nodes, reports, _) = graph_snapshot(&state, 10_000);
         assert!(nodes.iter().all(|n| n.node_id != "stale"));
         assert!(nodes.iter().any(|n| n.node_id == "fresh"));
         assert!(
@@ -710,12 +754,71 @@ mod tests {
             report_entry(0),
         );
 
-        let (nodes, reports) = graph_snapshot(&state, 10_000);
+        let (nodes, reports, _) = graph_snapshot(&state, 10_000);
         assert_eq!(nodes.len(), 2, "both nodes are still live");
         assert!(
             reports.is_empty(),
             "an observation older than the TTL must not keep a link alive"
         );
+    }
+
+    /// The snapshot Crawl is willing to ACCEPT must be one it can SEND.
+    ///
+    /// `MAX_REACHABILITY_ENTRIES_PER_PEER` bounds how many observations one
+    /// peer may hold, never how large each is, and `target`/`protocol` are
+    /// not constrained by `authorized()` even on an mTLS listener. One peer
+    /// staying inside every cap could therefore push `GraphSnapshot` past
+    /// `MAX_FRAME_LEN`, at which point `write_message` refused the frame and
+    /// every `GraphQuery` — from every Head and Fetch in the mesh — failed
+    /// for as long as the entries lived.
+    #[test]
+    fn a_snapshot_stays_within_the_frame_limit_however_large_the_state() {
+        let mut state = CrawlState::default();
+
+        for i in 0..MAX_REACHABILITY_ENTRIES_PER_PEER {
+            let target = format!("{i:04}{}", "t".repeat(1020));
+            assert!(
+                state.record_report(
+                    ("attacker".to_string(), target, "radii".to_string()),
+                    report_entry(0),
+                ),
+                "report {i} refused; the premise of this test no longer holds"
+            );
+        }
+
+        let (nodes, reports, dropped) = graph_snapshot(&state, 0);
+        let encoded =
+            postcard::to_allocvec(&RadiiMessage::GraphSnapshot { nodes, reports }).unwrap();
+
+        assert!(
+            encoded.len() as u32 <= radii_proto::MAX_FRAME_LEN,
+            "snapshot is {} bytes, over the {} byte frame limit",
+            encoded.len(),
+            radii_proto::MAX_FRAME_LEN
+        );
+        assert!(
+            dropped > 0,
+            "the oversized state should have been reported as truncated"
+        );
+    }
+
+    /// Truncation is for overflow only: a snapshot that fits must come
+    /// through whole, or the cap would silently shrink healthy meshes.
+    #[test]
+    fn a_snapshot_that_fits_is_not_truncated() {
+        let mut state = CrawlState::default();
+        state
+            .nodes
+            .insert("a".to_string(), entry(vec!["resource"], 0));
+        state.record_report(
+            ("a".to_string(), "b".to_string(), "http".to_string()),
+            report_entry(0),
+        );
+
+        let (nodes, reports, dropped) = graph_snapshot(&state, 0);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(dropped, 0);
     }
 
     #[test]
@@ -731,7 +834,7 @@ mod tests {
             report_entry(0),
         );
 
-        let (_, reports) = graph_snapshot(&state, 0);
+        let (_, reports, _) = graph_snapshot(&state, 0);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].from, "head");
     }

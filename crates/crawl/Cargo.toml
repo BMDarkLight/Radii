@@ -20,6 +20,7 @@ toml = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 tempfile = "3"
 radii-proto = { path = "../proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }

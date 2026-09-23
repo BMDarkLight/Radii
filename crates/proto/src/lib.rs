@@ -21,6 +21,47 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 /// Protects listeners from unbounded allocations on a hostile length prefix.
 pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 
+/// How much of a frame Crawl may fill with `GraphSnapshot` contents.
+///
+/// The remainder is headroom for the envelope the contents sit in: the
+/// message's variant tag and the two `Vec` length prefixes. A producer that
+/// fills to this budget using the `*_encoded_bound` helpers below is
+/// guaranteed to emit a frame within [`MAX_FRAME_LEN`].
+pub const SNAPSHOT_BUDGET: u32 = MAX_FRAME_LEN - 1024;
+
+/// Upper bound on the postcard encoding of a string.
+///
+/// postcard writes a varint length followed by the raw bytes. Five bytes
+/// covers a varint for any length that could fit in a frame several orders
+/// of magnitude larger than [`MAX_FRAME_LEN`], so this never
+/// under-estimates.
+fn encoded_str_bound(value: &str) -> usize {
+    value.len() + 5
+}
+
+/// Upper bound on the postcard encoding of one [`NodeInfo`].
+pub fn node_info_encoded_bound(node: &NodeInfo) -> usize {
+    // Two `Vec`s, each with its own varint length prefix.
+    let listen_addrs: usize = node
+        .listen_addrs
+        .iter()
+        .map(|entry| encoded_str_bound(&entry.addr) + encoded_str_bound(&entry.role))
+        .sum();
+    let roles: usize = node.roles.iter().map(|role| encoded_str_bound(role)).sum();
+    encoded_str_bound(&node.node_id) + 5 + listen_addrs + 5 + roles
+}
+
+/// Upper bound on the postcard encoding of one [`GraphReport`].
+pub fn graph_report_encoded_bound(report: &GraphReport) -> usize {
+    encoded_str_bound(&report.from)
+        + encoded_str_bound(&report.target)
+        + encoded_str_bound(&report.protocol)
+        // `reachable` is one byte; `rtt_ms` is a one-byte Option tag plus a
+        // u32 varint, which is at most five.
+        + 1
+        + 6
+}
+
 /// Maximum hops in a single `TunnelOpen` path.
 ///
 /// Mirrors `radii_core::routing::MAX_ROUTE_HOPS`. It is duplicated rather
@@ -39,6 +80,26 @@ pub const MAX_LISTEN_ADDRS: usize = 16;
 pub const MAX_LISTEN_ADDR_LEN: usize = 256;
 /// Maximum length of one address role string.
 pub const MAX_ROLE_LEN: usize = 64;
+
+/// Maximum length of a node id, wherever one appears on the wire.
+///
+/// Node ids are peer-chosen and Crawl keys its registry and its reachability
+/// table by them, so an unbounded one is memory a peer parks permanently.
+/// The count of entries was already capped; this caps their size, which is
+/// the half that let a peer stay inside every quota and still push a
+/// `GraphSnapshot` past [`MAX_FRAME_LEN`]. Applies to `node_id`, and to a
+/// report's `from`/`target` — note that `authorized()` constrains only
+/// `from` against the peer's certificate, so `target` is bounded here or
+/// nowhere.
+pub const MAX_NODE_ID_LEN: usize = 256;
+/// Maximum length of a protocol identifier (`http`, `radii`, …).
+pub const MAX_PROTOCOL_LEN: usize = 64;
+/// Maximum node-level roles in a `NodeHello`.
+///
+/// Distinct from [`MAX_LISTEN_ADDRS`]: those are advertised listeners, these
+/// are the node's own declared roles. Both were peer-supplied; only the
+/// former was bounded.
+pub const MAX_NODE_ROLES: usize = 16;
 
 /// A connected transport, plaintext or TLS — boxing behind this trait lets
 /// connection-handling code stay transport-agnostic once the (optional) TLS
@@ -378,20 +439,146 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
         }
     }
 
-    // Both shapes a `NodeHello` can arrive in. A hello relayed through a
-    // Head bridge is wrapped in `FromHead`, so matching only the direct
-    // shape would leave the bound reachable-around by going via a Head —
-    // which is exactly the path Head exists to provide.
-    match &message {
-        RadiiMessage::NodeHello { listen_addrs, .. }
-        | RadiiMessage::FromHead {
-            message: RelayedMessage::NodeHello { listen_addrs, .. },
-            ..
-        } => validate_listen_addrs(listen_addrs)?,
-        _ => {}
-    }
+    validate_message(&message)?;
 
     Ok(message)
+}
+
+/// Bounds every peer-supplied string and list on a decoded message.
+///
+/// Centralised so the direct and Head-relayed shapes cannot drift: a hello
+/// or report relayed through a Head arrives wrapped in `FromHead`, and a
+/// bound enforced only on the direct shape is one an attacker reaches
+/// around by going via a Head — which is exactly the path Head exists to
+/// provide.
+fn validate_message(message: &RadiiMessage) -> Result<()> {
+    match message {
+        RadiiMessage::NodeHello {
+            node_id,
+            roles,
+            listen_addrs,
+        } => validate_hello(node_id, roles, listen_addrs),
+        RadiiMessage::ReachabilityReport {
+            from,
+            target,
+            protocol,
+            observed_addr,
+            ..
+        } => validate_report(from, target, protocol, observed_addr.as_deref()),
+        RadiiMessage::ReachabilityProbe { from, to, .. } => {
+            validate_node_id(from)?;
+            validate_node_id(to)
+        }
+        RadiiMessage::FromHead {
+            source,
+            client_identity,
+            message,
+        } => {
+            if source.len() > MAX_LISTEN_ADDR_LEN {
+                bail!(
+                    "from_head source length {} exceeds {MAX_LISTEN_ADDR_LEN}",
+                    source.len()
+                );
+            }
+            if let Some(identity) = client_identity {
+                validate_node_id(identity)?;
+            }
+            match message {
+                RelayedMessage::NodeHello {
+                    node_id,
+                    roles,
+                    listen_addrs,
+                } => validate_hello(node_id, roles, listen_addrs),
+                RelayedMessage::ReachabilityReport {
+                    from,
+                    target,
+                    protocol,
+                    observed_addr,
+                    ..
+                } => validate_report(from, target, protocol, observed_addr.as_deref()),
+                RelayedMessage::ReachabilityProbe { from, to, .. } => {
+                    validate_node_id(from)?;
+                    validate_node_id(to)
+                }
+            }
+        }
+        // A poller reads this from Crawl, so the same bounds are what keep a
+        // hostile or compromised Crawl from pushing unbounded strings into
+        // Head's and Fetch's route planners.
+        RadiiMessage::GraphSnapshot { nodes, reports } => {
+            for node in nodes {
+                validate_hello(&node.node_id, &node.roles, &node.listen_addrs)?;
+            }
+            for report in reports {
+                validate_report(&report.from, &report.target, &report.protocol, None)?;
+            }
+            Ok(())
+        }
+        RadiiMessage::TunnelOpen { hops } => {
+            for hop in hops {
+                validate_node_id(&hop.node_id)?;
+                if hop.addr.len() > MAX_LISTEN_ADDR_LEN {
+                    bail!(
+                        "tunnel_open hop address length {} exceeds {MAX_LISTEN_ADDR_LEN}",
+                        hop.addr.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        RadiiMessage::Ack { .. } | RadiiMessage::GraphQuery => Ok(()),
+    }
+}
+
+fn validate_node_id(node_id: &str) -> Result<()> {
+    if node_id.len() > MAX_NODE_ID_LEN {
+        bail!("node id length {} exceeds {MAX_NODE_ID_LEN}", node_id.len());
+    }
+    Ok(())
+}
+
+fn validate_hello(node_id: &str, roles: &[String], listen_addrs: &[ListenAddr]) -> Result<()> {
+    validate_node_id(node_id)?;
+    if roles.len() > MAX_NODE_ROLES {
+        bail!(
+            "node_hello roles count {} exceeds {MAX_NODE_ROLES}",
+            roles.len()
+        );
+    }
+    for role in roles {
+        if role.len() > MAX_ROLE_LEN {
+            bail!(
+                "node_hello role length {} exceeds {MAX_ROLE_LEN}",
+                role.len()
+            );
+        }
+    }
+    validate_listen_addrs(listen_addrs)
+}
+
+fn validate_report(
+    from: &str,
+    target: &str,
+    protocol: &str,
+    observed_addr: Option<&str>,
+) -> Result<()> {
+    validate_node_id(from)?;
+    validate_node_id(target)?;
+    if protocol.len() > MAX_PROTOCOL_LEN {
+        bail!(
+            "report protocol length {} exceeds {MAX_PROTOCOL_LEN}",
+            protocol.len()
+        );
+    }
+    if let Some(addr) = observed_addr {
+        if addr.len() > MAX_LISTEN_ADDR_LEN {
+            bail!(
+                "report observed address length {} exceeds {MAX_LISTEN_ADDR_LEN}",
+                addr.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Bounds a peer-supplied listen-address list.
@@ -431,6 +618,261 @@ mod tests {
         let (mut client, mut server): (DuplexStream, DuplexStream) = tokio::io::duplex(64 * 1024);
         write_message(&mut client, &message).await.unwrap();
         read_message(&mut server).await.unwrap()
+    }
+
+    async fn decode(message: &RadiiMessage) -> Result<RadiiMessage> {
+        let mut buf = Vec::new();
+        write_message(&mut buf, message).await.unwrap();
+        read_message(&mut buf.as_slice()).await
+    }
+
+    /// `node_id` is a peer-chosen string that Crawl stores as a registry key.
+    /// It was never length-bounded, so one hello could park most of a frame
+    /// in Crawl's memory permanently.
+    #[tokio::test]
+    async fn rejects_a_hello_with_an_oversized_node_id() {
+        let err = decode(&RadiiMessage::NodeHello {
+            node_id: "n".repeat(MAX_NODE_ID_LEN + 1),
+            roles: vec![],
+            listen_addrs: vec![],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("node id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hello_with_too_many_roles() {
+        let err = decode(&RadiiMessage::NodeHello {
+            node_id: "n".into(),
+            roles: (0..=MAX_NODE_ROLES).map(|i| format!("r{i}")).collect(),
+            listen_addrs: vec![],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("roles"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hello_with_an_oversized_node_level_role() {
+        let err = decode(&RadiiMessage::NodeHello {
+            node_id: "n".into(),
+            roles: vec!["r".repeat(MAX_ROLE_LEN + 1)],
+            listen_addrs: vec![],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("role"), "got: {err}");
+    }
+
+    /// `target` and `protocol` are the fields `authorized()` does not check
+    /// even on an mTLS listener — only `from` is matched against the peer
+    /// identity. Bounding them is what stops an authenticated peer filling
+    /// its quota with arbitrarily large entries.
+    #[tokio::test]
+    async fn rejects_a_report_with_an_oversized_target() {
+        let err = decode(&RadiiMessage::ReachabilityReport {
+            from: "a".into(),
+            target: "t".repeat(MAX_NODE_ID_LEN + 1),
+            protocol: "radii".into(),
+            reachable: true,
+            rtt_ms: None,
+            observed_addr: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("node id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_report_with_an_oversized_protocol() {
+        let err = decode(&RadiiMessage::ReachabilityReport {
+            from: "a".into(),
+            target: "b".into(),
+            protocol: "p".repeat(MAX_PROTOCOL_LEN + 1),
+            reachable: true,
+            rtt_ms: None,
+            observed_addr: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("protocol"), "got: {err}");
+    }
+
+    /// The bound must cover a report relayed through a Head, not only a
+    /// direct one — going via a Head is exactly the path Head exists to
+    /// provide, and a limit enforced on one shape is not a limit.
+    #[tokio::test]
+    async fn rejects_a_relayed_report_with_an_oversized_target() {
+        let err = decode(&RadiiMessage::FromHead {
+            source: "127.0.0.1:1".into(),
+            client_identity: Some("a".into()),
+            message: RelayedMessage::ReachabilityReport {
+                from: "a".into(),
+                target: "t".repeat(MAX_NODE_ID_LEN + 1),
+                protocol: "radii".into(),
+                reachable: true,
+                rtt_ms: None,
+                observed_addr: None,
+            },
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("node id"),
+            "a relayed report must be bounded too; got: {err}"
+        );
+    }
+
+    /// A poller reads `GraphSnapshot` from Crawl, so the same bounds protect
+    /// Head and Fetch from a hostile or compromised Crawl.
+    #[tokio::test]
+    async fn rejects_a_snapshot_carrying_an_oversized_node_id() {
+        let err = decode(&RadiiMessage::GraphSnapshot {
+            nodes: vec![NodeInfo {
+                node_id: "n".repeat(MAX_NODE_ID_LEN + 1),
+                listen_addrs: vec![],
+                roles: vec![],
+            }],
+            reports: vec![],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("node id"), "got: {err}");
+    }
+
+    /// Bounds must not reject anything legitimate.
+    #[tokio::test]
+    async fn accepts_realistic_messages_at_the_bounds() {
+        let hello = RadiiMessage::NodeHello {
+            node_id: "n".repeat(MAX_NODE_ID_LEN),
+            roles: (0..MAX_NODE_ROLES).map(|i| format!("role-{i}")).collect(),
+            listen_addrs: vec![ListenAddr {
+                addr: "127.0.0.1:7100".into(),
+                role: "relay".into(),
+            }],
+        };
+        assert_eq!(decode(&hello).await.unwrap(), hello);
+
+        let report = RadiiMessage::ReachabilityReport {
+            from: "node-a".into(),
+            target: "t".repeat(MAX_NODE_ID_LEN),
+            protocol: "p".repeat(MAX_PROTOCOL_LEN),
+            reachable: true,
+            rtt_ms: Some(12),
+            observed_addr: Some("a".repeat(MAX_LISTEN_ADDR_LEN)),
+        };
+        assert_eq!(decode(&report).await.unwrap(), report);
+    }
+
+    /// The budget helpers must never under-estimate what postcard actually
+    /// emits, or Crawl would fill a snapshot right up to a limit it then
+    /// exceeded — the exact failure they exist to prevent.
+    #[test]
+    fn encoded_bounds_never_underestimate_postcard() {
+        let nodes = [
+            NodeInfo {
+                node_id: String::new(),
+                listen_addrs: Vec::new(),
+                roles: Vec::new(),
+            },
+            NodeInfo {
+                node_id: "node-a".into(),
+                listen_addrs: vec![ListenAddr {
+                    addr: "127.0.0.1:7100".into(),
+                    role: "relay".into(),
+                }],
+                roles: vec!["crawl".into(), "resource".into()],
+            },
+            NodeInfo {
+                node_id: "n".repeat(4096),
+                listen_addrs: (0..MAX_LISTEN_ADDRS)
+                    .map(|i| ListenAddr {
+                        addr: format!("{i}{}", "a".repeat(MAX_LISTEN_ADDR_LEN - 1)),
+                        role: "r".repeat(MAX_ROLE_LEN),
+                    })
+                    .collect(),
+                roles: (0..64).map(|i| format!("role-{i}")).collect(),
+            },
+        ];
+        for node in &nodes {
+            let actual = postcard::to_allocvec(node).unwrap().len();
+            let bound = node_info_encoded_bound(node);
+            assert!(
+                bound >= actual,
+                "bound {bound} under-estimates actual {actual} for {node:?}"
+            );
+        }
+
+        let reports = [
+            GraphReport {
+                from: String::new(),
+                target: String::new(),
+                protocol: String::new(),
+                reachable: false,
+                rtt_ms: None,
+            },
+            GraphReport {
+                from: "a".into(),
+                target: "b".into(),
+                protocol: "radii".into(),
+                reachable: true,
+                rtt_ms: Some(u32::MAX),
+            },
+            GraphReport {
+                from: "f".repeat(8192),
+                target: "t".repeat(8192),
+                protocol: "p".repeat(512),
+                reachable: true,
+                rtt_ms: Some(1),
+            },
+        ];
+        for report in &reports {
+            let actual = postcard::to_allocvec(report).unwrap().len();
+            let bound = graph_report_encoded_bound(report);
+            assert!(
+                bound >= actual,
+                "bound {bound} under-estimates actual {actual} for {report:?}"
+            );
+        }
+    }
+
+    /// A snapshot filled to `SNAPSHOT_BUDGET` by those bounds must still
+    /// encode within `MAX_FRAME_LEN` once the envelope is added.
+    #[test]
+    fn snapshot_budget_leaves_room_for_the_envelope() {
+        let reports: Vec<GraphReport> = (0..20_000)
+            .map(|i| GraphReport {
+                from: format!("node-{i:06}"),
+                target: format!("node-{:06}", i + 1),
+                protocol: "radii".into(),
+                reachable: true,
+                rtt_ms: Some(42),
+            })
+            .collect();
+
+        let mut used = 0usize;
+        let mut kept = Vec::new();
+        for report in reports {
+            let cost = graph_report_encoded_bound(&report);
+            if used + cost > SNAPSHOT_BUDGET as usize {
+                break;
+            }
+            used += cost;
+            kept.push(report);
+        }
+        assert!(!kept.is_empty(), "the budget must admit some reports");
+
+        let encoded = postcard::to_allocvec(&RadiiMessage::GraphSnapshot {
+            nodes: Vec::new(),
+            reports: kept,
+        })
+        .unwrap();
+        assert!(
+            encoded.len() as u32 <= MAX_FRAME_LEN,
+            "a budget-filled snapshot encoded to {} bytes, over {MAX_FRAME_LEN}",
+            encoded.len()
+        );
     }
 
     #[tokio::test]
