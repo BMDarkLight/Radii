@@ -98,6 +98,7 @@ async fn head_reports_ranked_candidates() {
     let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
         snapshot,
         listen_addrs,
+        ..GraphState::default()
     }));
 
     let mut node_map = HashMap::new();

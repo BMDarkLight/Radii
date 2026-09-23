@@ -48,7 +48,18 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
                 std::time::Duration::from_millis(config.http.attempt_timeout_ms),
                 std::time::Duration::from_millis(config.http.response_timeout_ms),
                 tls.clone(),
-            ),
+            )
+            // `/health` reports on what this Head actually depends on: with
+            // no `[graph]` there is no freshness to report, and with one a
+            // poller that has stopped landing queries must not keep
+            // answering 200.
+            .with_health(match config.graph.as_ref() {
+                Some(graph_config) => http::HealthWatch::from_graph_config(
+                    Arc::clone(&graph_state),
+                    graph_config.poll_interval_ms,
+                ),
+                None => http::HealthWatch::none(),
+            }),
         ))
         .register(runners::RadiiRunner::maybe_new(
             config.radii.clone(),

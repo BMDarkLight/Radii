@@ -34,6 +34,75 @@ pub struct AppState {
     /// Identity used for both layers of a chain to a graph-resolved backend.
     /// Absent means plaintext, matching the rest of the project's opt-in TLS.
     chain_tls: Option<TlsIdentity>,
+    health: HealthWatch,
+}
+
+/// What `/health` inspects before answering.
+///
+/// The protocol registry already takes the process down when a runner
+/// *fails*. What it cannot see is a runner that is merely *degraded*: the
+/// graph poller logs a warning and retries on every failed query, by design,
+/// so a Head cut off from Crawl keeps serving from a snapshot that gets
+/// older every interval. Nothing else in the process distinguishes that from
+/// healthy, which is exactly what a health check is for.
+#[derive(Clone, Default)]
+pub struct HealthWatch {
+    graph: Option<(crate::graph::SharedGraphState, Duration)>,
+}
+
+impl HealthWatch {
+    /// No `[graph]` configured: Head serves its static routing config, and
+    /// there is no freshness to report on.
+    pub fn none() -> Self {
+        Self { graph: None }
+    }
+
+    /// Reports the graph stale once no successful poll has landed within
+    /// `max_age`.
+    pub fn graph(state: crate::graph::SharedGraphState, max_age: Duration) -> Self {
+        Self {
+            graph: Some((state, max_age)),
+        }
+    }
+
+    /// How many poll intervals may be missed before the graph is stale.
+    ///
+    /// Three rather than one: a single missed poll is a transient blip —
+    /// Crawl restarting, a dropped packet — and flapping a load balancer on
+    /// that would cause more disruption than it prevents. Three consecutive
+    /// failures is a pattern.
+    pub const STALE_AFTER_INTERVALS: u32 = 3;
+
+    /// The watch implied by a `[graph]` config's poll interval.
+    pub fn from_graph_config(state: crate::graph::SharedGraphState, poll_interval_ms: u64) -> Self {
+        let interval = Duration::from_millis(poll_interval_ms.max(1));
+        Self::graph(state, interval * Self::STALE_AFTER_INTERVALS)
+    }
+
+    /// `(healthy, graph state label)`.
+    fn evaluate(&self) -> (bool, &'static str) {
+        let Some((state, max_age)) = &self.graph else {
+            return (true, "not_configured");
+        };
+        let Ok(guard) = state.read() else {
+            // The poller panicked holding the write side. Every route
+            // decision from here reads a poisoned lock and falls back, which
+            // is precisely a degraded Head.
+            return (false, "poisoned");
+        };
+        match guard.last_refresh {
+            None => (false, "never_refreshed"),
+            Some(at) if at.elapsed() > *max_age => (false, "stale"),
+            Some(_) => (true, "fresh"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    /// `not_configured`, `fresh`, `stale`, `never_refreshed`, or `poisoned`.
+    graph: &'static str,
 }
 
 #[derive(Serialize)]
@@ -68,6 +137,7 @@ pub fn default_state(decision: DecisionEngine) -> AppState {
         attempt_timeout: Duration::from_millis(3000),
         response_timeout: Duration::from_millis(30_000),
         chain_tls: None,
+        health: HealthWatch::none(),
     }
 }
 
@@ -83,6 +153,15 @@ pub fn state_with(
         attempt_timeout,
         response_timeout,
         chain_tls,
+        health: HealthWatch::none(),
+    }
+}
+
+impl AppState {
+    /// Points `/health` at what this Head actually depends on.
+    pub fn with_health(mut self, health: HealthWatch) -> Self {
+        self.health = health;
+        self
     }
 }
 
@@ -108,8 +187,28 @@ pub async fn serve_http_on_with(listener: TcpListener, state: AppState) -> anyho
     Ok(())
 }
 
-async fn health() -> StatusCode {
-    StatusCode::OK
+/// Reports whether Head can currently do its job, not merely that its HTTP
+/// listener is up.
+///
+/// Returns 503 rather than 200 when the graph poller has gone stale, so a
+/// load balancer can route around a Head that is serving from an
+/// increasingly old view of the mesh. The body names the reason: an operator
+/// seeing a 503 needs to know whether Crawl is unreachable or this Head
+/// simply has not finished starting.
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    let (healthy, graph) = state.health.evaluate();
+    let code = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(HealthResponse {
+            status: if healthy { "ok" } else { "degraded" },
+            graph,
+        }),
+    )
 }
 
 async fn decision_json(

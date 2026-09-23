@@ -112,11 +112,17 @@ async fn health_is_answered_locally_and_not_proxied() {
     let handle = tokio::spawn(async move { serve_http_on(listener, decision).await });
 
     let response = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+    // 200 because this Head has no `[graph]` to be stale about; the body is
+    // Head's own health document, never the origin's response.
     assert_eq!(response.status(), 200);
-    assert_eq!(
-        response.text().await.unwrap(),
-        "",
-        "health must be answered by Head, not forwarded to an origin"
+    let body = response.text().await.unwrap();
+    assert!(
+        !body.contains("origin"),
+        "health must be answered by Head, not forwarded to an origin; got: {body}"
+    );
+    assert!(
+        body.contains("\"status\":\"ok\""),
+        "health must report Head's own status; got: {body}"
     );
     handle.abort();
 }
@@ -343,6 +349,7 @@ async fn fails_over_to_a_second_node_without_the_client_noticing() {
     let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
         snapshot,
         listen_addrs,
+        ..GraphState::default()
     }));
 
     let mut node_map = HashMap::new();
@@ -527,6 +534,7 @@ async fn reaches_a_backend_only_through_an_intermediate_relay() {
     let state: SharedGraphState = Arc::new(RwLock::new(GraphState {
         snapshot,
         listen_addrs,
+        ..GraphState::default()
     }));
 
     let mut node_map = HashMap::new();

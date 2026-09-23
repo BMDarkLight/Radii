@@ -14,7 +14,7 @@ use radii_core::routing::{GraphSnapshot, Link, NodeId, ProtocolId, RoleId};
 use radii_proto::tls::TlsIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Live view of Crawl's reachability graph plus the node listen-address
 /// registry, refreshed on an interval by [`run_poll`].
@@ -22,6 +22,14 @@ use std::time::Duration;
 pub struct GraphState {
     pub snapshot: GraphSnapshot,
     pub listen_addrs: HashMap<String, Vec<(String, String)>>,
+    /// When the last *successful* query landed. `None` means no poll has
+    /// ever succeeded, so the snapshot above is empty rather than stale.
+    ///
+    /// A failed query is logged and retried rather than propagated, which
+    /// keeps a Crawl outage from taking Head down — but it also means
+    /// nothing else records that Head is now routing from an increasingly
+    /// old view. This is what `/health` reads to report that.
+    pub last_refresh: Option<Instant>,
 }
 
 pub type SharedGraphState = Arc<RwLock<GraphState>>;
@@ -42,6 +50,7 @@ pub async fn run_poll(
                 let mut guard = state.write().expect("graph state poisoned");
                 guard.snapshot = snapshot;
                 guard.listen_addrs = listen_addrs;
+                guard.last_refresh = Some(Instant::now());
                 tracing::debug!(upstream = %config.crawl_upstream, "head graph refreshed");
             }
             Err(err) => {
@@ -163,6 +172,7 @@ mod tests {
         Arc::new(RwLock::new(GraphState {
             snapshot,
             listen_addrs,
+            ..GraphState::default()
         }))
     }
 

@@ -347,6 +347,7 @@ mod tests {
         Arc::new(RwLock::new(GraphState {
             snapshot,
             listen_addrs,
+            ..GraphState::default()
         }))
     }
 
