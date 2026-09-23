@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Generated ASCII art: gen-ascii-mark.py writes LF, so keep the working tree
+# LF too — otherwise every run of it shows a spurious diff on Windows.
+assets/brand/ascii/*.txt text eol=lf

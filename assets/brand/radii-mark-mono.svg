@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none" role="img" aria-label="Radii">
+  <title>Radii</title>
+  <g stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10 54 L56 54"/>
+    <path d="M10 54 L49.84 31"/>
+    <path d="M10 54 L33 14.16"/>
+    <path d="M10 54 L10 8"/>
+    <path d="M28 54 L25.59 45 L19 38.41 L10 36"/>
+    <path d="M43 54 L38.58 37.5 L26.5 25.42 L10 21"/>
+  </g>
+  <circle cx="10" cy="54" r="3.4" fill="currentColor"/>
+</svg>

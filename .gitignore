@@ -32,3 +32,6 @@ log.*
 # Local certs / keys (dev only)
 **/certs/
 **/ssh_host_*
+
+# Python bytecode from scripts/
+__pycache__/
