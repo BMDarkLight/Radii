@@ -9,8 +9,10 @@
 // option) any later version. See the LICENSE file for the full text and
 // additional terms.
 
+mod brand;
+
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use radii_core::routing::{
     DefaultScorer, GraphSnapshot, NodeId, ProtocolId, ReachabilityReport, RoutePlanner,
     RouteRequest,
@@ -20,11 +22,76 @@ use radii_proto::RadiiMessage;
 use std::io::{stdin, BufRead};
 use std::path::PathBuf;
 
+/// Commands grouped the way the system is: Crawl's discovery surface, then
+/// Fetch's routing surface. A flat list of three hides the architecture that
+/// the whole project is organised around.
+///
+/// `every_command_is_grouped` keeps this honest when a command is added.
+const GROUPS: &[(&str, &[&str])] = &[("Discovery", &["hello", "report"]), ("Routing", &["plan"])];
+
 #[derive(Parser)]
-#[command(name = "radii", version, about = "Radii operator CLI")]
+#[command(
+    name = "radii",
+    version,
+    about = brand::TAGLINE,
+    styles = brand::clap_styles(),
+    disable_help_subcommand = true,
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Renders the grouped command list plus the reachability legend, reading the
+/// names and descriptions back off the built `Command` so this can never drift
+/// from what the CLI actually accepts.
+fn command_sections(cmd: &clap::Command, term: &brand::Term) -> String {
+    let mut out = String::new();
+    for (i, (heading, names)) in GROUPS.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&brand::heading(heading, term));
+        out.push('\n');
+        for name in *names {
+            let Some(sub) = cmd.get_subcommands().find(|s| s.get_name() == *name) else {
+                continue;
+            };
+            let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            // Pad on the name's own width: a tint adds bytes that occupy no
+            // columns, so `{:<10}` on the styled string would indent short.
+            let pad = " ".repeat(10usize.saturating_sub(name.chars().count()));
+            out.push_str(&format!("  {}{pad}{about}\n", brand::literal(name, term)));
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// The banner already carries the name and the tagline, so the template drops
+/// clap's about line. `{subcommands}` goes too — clap has no notion of
+/// subcommand groups, so the compartments come through `{after-help}` — and
+/// that puts commands ahead of options, which is the order they matter in.
+fn help_template(term: &brand::Term) -> String {
+    format!(
+        "{{before-help}}{{usage-heading}} {{usage}}{{after-help}}\n\n{}\n{{options}}\n\n{}\n",
+        brand::heading("Options", term),
+        brand::legend(term),
+    )
+}
+
+fn build_command(term: &brand::Term) -> clap::Command {
+    let base = Cli::command();
+    let after = command_sections(&base, term);
+    let mut cmd = base.help_template(help_template(term)).after_help(after);
+    if let Some(banner) = brand::banner(term, env!("CARGO_PKG_VERSION")) {
+        cmd = cmd.before_help(banner);
+    }
+    // clap prints `{name} {version}`, so the long form adds the tagline rather
+    // than the mark — artwork behind that prefix reads as a stray word.
+    // `-V` stays the bare one-liner scripts parse.
+    cmd.long_version(format!("{}\n{}", env!("CARGO_PKG_VERSION"), brand::TAGLINE))
 }
 
 /// mTLS options for talking to a Crawl (or Crawl-speaking) listener that has
@@ -114,7 +181,9 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = radii_core::logging::init("radii-cli")?;
-    let cli = Cli::parse();
+    let term = brand::Term::detect();
+    let matches = build_command(&term).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match cli.command {
         Commands::Hello {
@@ -152,7 +221,7 @@ async fn main() -> Result<()> {
             protocols,
             max_hops,
             limit,
-        } => plan_routes(source, target, protocols, max_hops, limit),
+        } => plan_routes(source, target, protocols, max_hops, limit, &term),
     }
 }
 
@@ -243,6 +312,7 @@ fn plan_routes(
     protocols: Vec<String>,
     max_hops: usize,
     limit: usize,
+    term: &brand::Term,
 ) -> Result<()> {
     let mut reports = Vec::new();
     let stdin = stdin();
@@ -270,17 +340,27 @@ fn plan_routes(
     let planner = RoutePlanner::new(DefaultScorer);
     let results = planner.plan(&snapshot, &request, limit);
 
-    for route in results {
-        let hops = route
-            .hops
-            .iter()
-            .map(|n| n.0.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        println!(
-            "score={:.1} protocol={} path={}",
-            route.score, route.protocol.0, hops
-        );
+    // Only a terminal a human is reading gets the table. Anything piped keeps
+    // the original key=value line, because something out there is parsing it.
+    for (rank, route) in results.iter().enumerate() {
+        let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
+        if term.stdout_is_tty {
+            println!(
+                "{} {:>2}  {:>6.1}  {:<8}  {}",
+                brand::tinted("\u{25cf}", brand::REACH, term),
+                rank + 1,
+                route.score,
+                route.protocol.0,
+                names.join(" \u{2192} "),
+            );
+        } else {
+            println!(
+                "score={:.1} protocol={} path={}",
+                route.score,
+                route.protocol.0,
+                names.join(" -> ")
+            );
+        }
     }
 
     Ok(())
@@ -289,6 +369,41 @@ fn plan_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_command_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// The grouped help is hand-curated, so a command added to `Commands` and
+    /// forgotten in `GROUPS` would silently vanish from `--help`.
+    #[test]
+    fn every_command_is_grouped() {
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            let groups = GROUPS
+                .iter()
+                .filter(|(_, names)| names.contains(&name))
+                .count();
+            assert_eq!(groups, 1, "{name} should appear in exactly one help group");
+        }
+    }
+
+    #[test]
+    fn the_grouped_help_lists_every_command_with_its_description() {
+        let cmd = Cli::command();
+        let sections = command_sections(&cmd, &brand::Term::default());
+        for sub in cmd.get_subcommands() {
+            assert!(
+                sections.contains(sub.get_name()),
+                "{} missing from the help sections",
+                sub.get_name()
+            );
+        }
+        assert!(sections.contains("Discovery"));
+        assert!(sections.contains("Routing"));
+    }
 
     #[test]
     fn tls_args_none_means_plaintext() {

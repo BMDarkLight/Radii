@@ -11,8 +11,9 @@ name = "radii"
 path = "src/main.rs"
 
 [dependencies]
+anstyle = "1"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 radii-core = { path = "../core" }
 radii-proto = { path = "../proto" }
 serde = { version = "1", features = ["derive"] }
