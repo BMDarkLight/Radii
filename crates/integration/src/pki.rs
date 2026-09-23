@@ -14,11 +14,16 @@
 //! never commit real key material, per `SECURITY.md`.
 
 use radii_proto::tls::TlsIdentityConfig;
-use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType};
+use rcgen::{
+    date_time_ymd, CertificateParams, CertificateRevocationListParams, DistinguishedName, DnType,
+    Ia5String, KeyPair, RevocationReason, RevokedCertParams, SanType, SerialNumber,
+};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 pub struct TestCa {
@@ -27,6 +32,8 @@ pub struct TestCa {
     key: KeyPair,
     ca_path: PathBuf,
     counter: AtomicU32,
+    /// Serial per issued node id, so [`Self::revoke`] can name them.
+    serials: Mutex<HashMap<String, u64>>,
 }
 
 impl TestCa {
@@ -38,6 +45,12 @@ impl TestCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "Radii Test CA");
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            // Required for this CA to be a valid CRL issuer.
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
         let key = KeyPair::generate().expect("generate CA key");
         let cert = params.self_signed(&key).expect("self-sign CA cert");
         let ca_path = write_pem(dir.path(), "ca.cert.pem", &cert.pem());
@@ -48,6 +61,7 @@ impl TestCa {
             key,
             ca_path,
             counter: AtomicU32::new(0),
+            serials: Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,10 +78,19 @@ impl TestCa {
             SanType::IpAddress("127.0.0.1".parse().unwrap()),
             SanType::DnsName(Ia5String::try_from("localhost").unwrap()),
         ];
+        // Explicit, so `revoke` can name this certificate in a CRL. rcgen
+        // otherwise picks a random serial, and a CRL entry must match one
+        // exactly.
+        let serial = u64::from(n) + 1;
+        params.serial_number = Some(SerialNumber::from(serial));
         let key = KeyPair::generate().expect("generate leaf key");
         let cert = params
             .signed_by(&key, &self.cert, &self.key)
             .expect("sign leaf cert");
+        self.serials
+            .lock()
+            .expect("serial table poisoned")
+            .insert(node_id.to_string(), serial);
 
         let cert_path = write_pem(self.dir.path(), &format!("{n}.cert.pem"), &cert.pem());
         let key_path = write_pem(
@@ -80,7 +103,46 @@ impl TestCa {
             cert: cert_path,
             key: key_path,
             ca: self.ca_path.clone(),
+            crl: None,
         }
+    }
+
+    /// Writes a CRL revoking the named nodes and returns its path, for
+    /// setting as `TlsIdentityConfig::crl`. Each node must already have been
+    /// issued by [`Self::issue`].
+    pub fn revoke(&self, node_ids: &[&str]) -> PathBuf {
+        let serials = self.serials.lock().expect("serial table poisoned");
+        let revoked_certs = node_ids
+            .iter()
+            .map(|node_id| {
+                let serial = *serials
+                    .get(*node_id)
+                    .unwrap_or_else(|| panic!("{node_id} was never issued a certificate"));
+                RevokedCertParams {
+                    serial_number: SerialNumber::from(serial),
+                    revocation_time: date_time_ymd(2026, 1, 1),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                }
+            })
+            .collect();
+
+        let params = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params
+            .signed_by(&self.cert, &self.key)
+            .expect("sign test CRL");
+        write_pem(
+            self.dir.path(),
+            "revoked.crl.pem",
+            &crl.pem().expect("CRL to PEM"),
+        )
     }
 
     /// The path to this CA's own certificate, for constructing an identity

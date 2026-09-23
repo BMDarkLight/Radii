@@ -102,7 +102,29 @@ To rotate the CA itself (e.g. on a schedule, or because you suspect the CA key i
 
 ## Revocation
 
-There is no CRL or OCSP support. If a node's key is compromised, the only way to revoke its trust today is to **rotate the CA** (see above) and exclude that node from the new leaf certificates you issue — every other node's `ca` bundle no longer includes a CA that would validate the compromised node's old certificate. This is heavyweight; track it as a known gap when planning a deployment where compromise response time matters.
+A certificate revocation list is supported. Add a `crl` path to any `[tls]`-style section and the listed certificates are refused:
+
+```toml
+[tls]
+cert = "./certs/crawl.cert.pem"
+key  = "./certs/crawl.key.pem"
+ca   = "./certs/ca.cert.pem"
+crl  = "./certs/revoked.crl.pem"   # optional
+```
+
+The same field works on `[relay.tls]`, `[tunnel_tls.listener]`, and `[tunnel_tls.upstream]`, and the CLI takes `--tls-crl` alongside `--tls-cert`/`--tls-key`/`--tls-ca`.
+
+What it does and does not do:
+
+- **Checked in both directions.** A revoked certificate is refused whether the peer presents it as a client or as a server. A client-only check would leave a revoked node still able to answer as a server, which is how traffic would keep reaching it.
+- **End-entity only.** Revocation is checked for the peer's leaf certificate, not the whole chain. A private mesh CA has no issuer above it to publish its own revocation status, so checking the full chain would fail every handshake on the CA's unknown status rather than on anything meaningful.
+- **Per node, not global.** A CRL only affects nodes that load it. Roll it out to every node that must refuse the revoked peer — a node without it keeps accepting that certificate. This is the practical cost of file-based revocation with no distribution mechanism.
+- **Read once at startup.** Like `cert`/`key`/`ca`, the CRL is loaded when the process starts and is not watched for changes. Restart after updating it.
+- **A configured-but-unreadable CRL fails to load.** A missing or malformed file is an error, not an empty list — silently falling back to "revoke nothing" would leave you believing revocation is enforced when it is not.
+
+Generate one with your CA tooling of choice; the CA certificate needs the `cRLSign` key usage to be a valid CRL issuer. `scripts/` generates throwaway certificates for local testing only.
+
+Revocation narrows what a leaked key gets an attacker, but it is not a substitute for rotation: **rotate the CA** (see above) if you suspect the *CA* key itself is compromised, since a CRL signed by a compromised CA proves nothing.
 
 ## Related gaps (not covered by TLS alone)
 

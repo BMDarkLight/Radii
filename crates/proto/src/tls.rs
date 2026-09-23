@@ -23,10 +23,11 @@
 
 use crate::{AsyncDuplex, BoxedStream};
 use anyhow::{bail, Context, Result};
+use rustls::client::WebPkiServerVerifier;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls_pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
@@ -45,6 +46,19 @@ pub struct TlsIdentityConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub ca: PathBuf,
+    /// PEM certificate revocation list, checked against every peer
+    /// certificate in both directions. Optional: absent means no revocation
+    /// checking, which is where this project started.
+    ///
+    /// Without it the only way to withdraw a compromised node's access is
+    /// rotating the CA and reissuing every certificate in the mesh — and
+    /// because relay admission is CA membership, a leaked key is a standing
+    /// grant of forwarding capacity until that happens. See `docs/tls.md`.
+    ///
+    /// Read once at load, like `cert`/`key`/`ca`: a CRL that changes on disk
+    /// takes effect at restart, not before.
+    #[serde(default)]
+    pub crl: Option<PathBuf>,
 }
 
 /// Loaded server and client TLS configurations sharing one node identity.
@@ -62,18 +76,47 @@ impl TlsIdentity {
 
         let certs = load_certs(&config.cert)?;
         let ca_certs = load_certs(&config.ca)?;
+        let crls = match &config.crl {
+            Some(path) => load_crls(path)?,
+            None => Vec::new(),
+        };
 
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(build_root_store(&ca_certs)?))
-            .build()
-            .context("building mTLS client verifier")?;
+        // Revocation is applied to BOTH directions. Checking only inbound
+        // client certificates would leave a revoked node able to keep
+        // answering as a server, which is exactly how traffic would continue
+        // to reach it.
+        let mut client_verifier =
+            WebPkiClientVerifier::builder(Arc::new(build_root_store(&ca_certs)?));
+        let mut server_verifier =
+            WebPkiServerVerifier::builder(Arc::new(build_root_store(&ca_certs)?));
+        if !crls.is_empty() {
+            // End-entity only: the leaf is the node identity being withdrawn,
+            // and a private mesh CA has no issuer above it to publish its own
+            // revocation status. Checking the full chain would make every
+            // handshake fail on the CA's unknown status instead.
+            client_verifier = client_verifier
+                .with_crls(crls.clone())
+                .only_check_end_entity_revocation();
+            server_verifier = server_verifier
+                .with_crls(crls)
+                .only_check_end_entity_revocation();
+        }
 
         let server = ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
+            .with_client_cert_verifier(
+                client_verifier
+                    .build()
+                    .context("building mTLS client verifier")?,
+            )
             .with_single_cert(certs.clone(), load_key(&config.key)?)
             .context("building TLS server config")?;
 
         let client = ClientConfig::builder()
-            .with_root_certificates(build_root_store(&ca_certs)?)
+            .with_webpki_verifier(
+                server_verifier
+                    .build()
+                    .context("building mTLS server verifier")?,
+            )
             .with_client_auth_cert(certs, load_key(&config.key)?)
             .context("building TLS client config")?;
 
@@ -121,6 +164,22 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         bail!("no certificates found in {}", path.display());
     }
     Ok(certs)
+}
+
+/// Loads a PEM certificate revocation list.
+///
+/// A configured-but-unreadable CRL is an error rather than an empty list:
+/// silently falling back to "revoke nothing" would leave an operator
+/// believing revocation is enforced when it is not.
+fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>> {
+    let crls = CertificateRevocationListDer::pem_file_iter(path)
+        .with_context(|| format!("opening crl file {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing crl file {}", path.display()))?;
+    if crls.is_empty() {
+        bail!("no certificate revocation list found in {}", path.display());
+    }
+    Ok(crls)
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
@@ -375,6 +434,7 @@ mod tests {
             cert: cert_path,
             key: key_path,
             ca: ca_path.to_path_buf(),
+            crl: None,
         }
     }
 
@@ -423,6 +483,226 @@ mod tests {
             node_b,
             outsider,
         }
+    }
+
+    struct CrlPki {
+        _dir: TempDir,
+        /// `node-a`, serving with the CRL configured.
+        server_with_crl: TlsIdentityConfig,
+        /// `node-b`, dialing with the CRL configured. Not revoked.
+        client_with_crl: TlsIdentityConfig,
+        /// `node-r`, named by the CRL. Also carries the CRL itself, so it
+        /// can be used from either end of a handshake.
+        revoked: TlsIdentityConfig,
+    }
+
+    /// Issues a leaf with an explicit serial, so a CRL can name it. rcgen
+    /// picks a random serial when none is set, and a CRL entry has to match
+    /// one exactly.
+    fn issue_leaf_with_serial(
+        dir: &Path,
+        prefix: &str,
+        common_name: &str,
+        serial: u64,
+        ca_cert: &rcgen::Certificate,
+        ca_key: &KeyPair,
+        ca_path: &Path,
+    ) -> TlsIdentityConfig {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.subject_alt_names = vec![
+            SanType::IpAddress("127.0.0.1".parse().unwrap()),
+            SanType::DnsName(Ia5String::try_from("localhost").unwrap()),
+        ];
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+
+        let cert_path = write_pem(dir, &format!("{prefix}.cert.pem"), &cert.pem());
+        let key_path = write_pem(dir, &format!("{prefix}.key.pem"), &key.serialize_pem());
+
+        TlsIdentityConfig {
+            cert: cert_path,
+            key: key_path,
+            ca: ca_path.to_path_buf(),
+            crl: None,
+        }
+    }
+
+    /// A CA with three leaves, one of them revoked by a CRL the other two
+    /// (and the revoked leaf itself) are configured with.
+    fn test_pki_with_crl() -> CrlPki {
+        use rcgen::{
+            date_time_ymd, CertificateRevocationListParams, RevocationReason, RevokedCertParams,
+            SerialNumber,
+        };
+
+        let dir = TempDir::new().unwrap();
+
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Radii Test CA");
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            // Required for the CA to be a valid CRL issuer.
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_path = write_pem(dir.path(), "ca.cert.pem", &ca_cert.pem());
+
+        const REVOKED_SERIAL: u64 = 0xBAD;
+
+        let crl_params = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(REVOKED_SERIAL),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = crl_params.signed_by(&ca_cert, &ca_key).unwrap();
+        let crl_path = write_pem(dir.path(), "revoked.crl.pem", &crl.pem().unwrap());
+
+        let mut server_with_crl = issue_leaf_with_serial(
+            dir.path(),
+            "node-a",
+            "node-a",
+            1,
+            &ca_cert,
+            &ca_key,
+            &ca_path,
+        );
+        let mut client_with_crl = issue_leaf_with_serial(
+            dir.path(),
+            "node-b",
+            "node-b",
+            2,
+            &ca_cert,
+            &ca_key,
+            &ca_path,
+        );
+        let mut revoked = issue_leaf_with_serial(
+            dir.path(),
+            "node-r",
+            "node-r",
+            REVOKED_SERIAL,
+            &ca_cert,
+            &ca_key,
+            &ca_path,
+        );
+        server_with_crl.crl = Some(crl_path.clone());
+        client_with_crl.crl = Some(crl_path.clone());
+        revoked.crl = Some(crl_path);
+
+        CrlPki {
+            _dir: dir,
+            server_with_crl,
+            client_with_crl,
+            revoked,
+        }
+    }
+
+    /// A revoked node must not be able to authenticate as a CLIENT.
+    ///
+    /// Without this, the only remedy for a compromised node is rotating the
+    /// whole CA — and since admission to a relay is CA membership, that cert
+    /// is a standing grant of forwarding capacity. See SECURITY.md.
+    #[tokio::test]
+    async fn a_revoked_client_certificate_is_refused() {
+        let pki = test_pki_with_crl();
+
+        let server_identity = TlsIdentity::load(&pki.server_with_crl).unwrap();
+        let revoked_client = TlsIdentity::load(&pki.revoked).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept(stream, Some(&server_identity)).await.map(|_| ())
+        });
+
+        let dialed = dial(&addr, Some(&revoked_client)).await;
+        let accepted = server.await.unwrap();
+
+        assert!(
+            dialed.is_err() || accepted.is_err(),
+            "a revoked client certificate must not complete a handshake"
+        );
+    }
+
+    /// The same list must apply to the SERVER side of a dial. A revoked node
+    /// that can still answer as a server could keep receiving traffic
+    /// routed to it, which is the half a client-only check would miss.
+    #[tokio::test]
+    async fn a_revoked_server_certificate_is_refused() {
+        let pki = test_pki_with_crl();
+
+        let revoked_server = TlsIdentity::load(&pki.revoked).unwrap();
+        let client_identity = TlsIdentity::load(&pki.client_with_crl).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accept(stream, Some(&revoked_server)).await;
+        });
+
+        assert!(
+            dial(&addr, Some(&client_identity)).await.is_err(),
+            "a revoked server certificate must not complete a handshake"
+        );
+    }
+
+    /// Revocation must not break the healthy path: a node the CRL does not
+    /// name still authenticates normally.
+    #[tokio::test]
+    async fn a_current_certificate_still_authenticates_when_a_crl_is_configured() {
+        let pki = test_pki_with_crl();
+
+        let server_identity = TlsIdentity::load(&pki.server_with_crl).unwrap();
+        let client_identity = TlsIdentity::load(&pki.client_with_crl).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_, peer) = accept(stream, Some(&server_identity)).await.unwrap();
+            peer
+        });
+
+        dial(&addr, Some(&client_identity))
+            .await
+            .expect("an unrevoked peer must still authenticate");
+        assert_eq!(server.await.unwrap().as_deref(), Some("node-b"));
+    }
+
+    /// A `crl` path that does not exist is a configuration error, surfaced
+    /// at load rather than silently leaving revocation unenforced.
+    #[test]
+    fn a_missing_crl_file_fails_to_load() {
+        let pki = test_pki();
+        let mut config = pki.node_a.clone();
+        config.crl = Some(PathBuf::from("/nonexistent/revoked.crl.pem"));
+        let err = TlsIdentity::load(&config)
+            .map(|_| ())
+            .expect_err("a missing CRL must not load as an empty one");
+        assert!(
+            err.to_string().contains("crl") || err.to_string().contains("revocation"),
+            "the error must name the CRL, got: {err}"
+        );
     }
 
     /// Every spelling a node can advertise in `listen_addrs`, and the host a

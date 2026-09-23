@@ -54,3 +54,6 @@ max_candidates = 3
 # cert = "/etc/radii/head.cert.pem"
 # key = "/etc/radii/head.key.pem"
 # ca = "/etc/radii/ca.cert.pem"
+# Optional: refuse peers named by this certificate revocation list, in
+# both directions. Read at startup; see docs/tls.md.
+# crl = "/etc/radii/revoked.crl.pem"

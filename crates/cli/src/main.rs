@@ -41,6 +41,10 @@ struct TlsArgs {
     /// CA bundle (PEM) used to verify the server's certificate.
     #[arg(long)]
     tls_ca: Option<PathBuf>,
+    /// Optional certificate revocation list (PEM). When given, a server
+    /// whose certificate it names is refused.
+    #[arg(long)]
+    tls_crl: Option<PathBuf>,
 }
 
 impl TlsArgs {
@@ -51,6 +55,7 @@ impl TlsArgs {
                 cert: cert.clone(),
                 key: key.clone(),
                 ca: ca.clone(),
+                crl: self.tls_crl.clone(),
             })?)),
             _ => anyhow::bail!("--tls-cert, --tls-key, and --tls-ca must all be provided together"),
         }
@@ -291,6 +296,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            tls_crl: None,
         };
         assert!(args.load().unwrap().is_none());
     }
@@ -301,6 +307,7 @@ mod tests {
             tls_cert: Some("cert.pem".into()),
             tls_key: None,
             tls_ca: None,
+            tls_crl: None,
         };
         assert!(args.load().is_err());
     }

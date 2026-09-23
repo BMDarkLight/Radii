@@ -20,6 +20,9 @@ attempt_timeout_ms = 3000
 # cert = "/etc/radii/fetch.cert.pem"
 # key = "/etc/radii/fetch.key.pem"
 # ca = "/etc/radii/ca.cert.pem"
+# Optional: refuse peers named by this certificate revocation list, in
+# both directions. Read at startup; see docs/tls.md.
+# crl = "/etc/radii/revoked.crl.pem"
 
 # Optional: encrypt the tunnel data path itself. `listener` and `upstream`
 # are independent — enable either, both, or neither.
@@ -27,11 +30,17 @@ attempt_timeout_ms = 3000
 # cert = "/etc/radii/fetch-tunnel.cert.pem"
 # key = "/etc/radii/fetch-tunnel.key.pem"
 # ca = "/etc/radii/ca.cert.pem"
+# Optional: refuse peers named by this certificate revocation list, in
+# both directions. Read at startup; see docs/tls.md.
+# crl = "/etc/radii/revoked.crl.pem"
 #
 # [tunnel_tls.upstream]
 # cert = "/etc/radii/fetch-tunnel.cert.pem"
 # key = "/etc/radii/fetch-tunnel.key.pem"
 # ca = "/etc/radii/ca.cert.pem"
+# Optional: refuse peers named by this certificate revocation list, in
+# both directions. Read at startup; see docs/tls.md.
+# crl = "/etc/radii/revoked.crl.pem"
 
 # Optional: accept relayed tunnel chains. Absent, this node neither forwards
 # chains for others nor terminates one addressed to it. Mutual TLS is
@@ -60,3 +69,6 @@ attempt_timeout_ms = 3000
 # cert = "/etc/radii/relay.cert.pem"
 # key = "/etc/radii/relay.key.pem"
 # ca = "/etc/radii/ca.cert.pem"
+# Optional: refuse peers named by this certificate revocation list, in
+# both directions. Read at startup; see docs/tls.md.
+# crl = "/etc/radii/revoked.crl.pem"
