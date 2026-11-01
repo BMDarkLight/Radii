@@ -65,7 +65,9 @@ radii-beacon = { git = "https://github.com/BMDarkLight/Radii", tag = "v0.1.0" }
   them, so a node id cannot carry terminal escape sequences.
 - Dependencies updated for RUSTSEC-2026-0346, -0347, -0348 and -0349
   (`rustls`), -0382 (`rustls-webpki`), -0381 (`webpki-roots`) and -0386
-  (`tokio`).
+  (`tokio`). The lockfile's `quinn-proto` is also updated for
+  RUSTSEC-2026-0338 to -0342; it belongs to an optional `reqwest` feature no
+  Radii build turns on, so no shipped binary contained it.
 
 ### Known gaps
 
