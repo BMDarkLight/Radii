@@ -41,12 +41,14 @@ pub const MAX_DATAGRAM: usize = 1200;
 
 const MAGIC: &[u8; 4] = b"RDB1";
 
-/// One answer per address in this window, so two nodes can't keep
-/// answering each other.
+/// One answer per host in this window, so two nodes can't keep answering
+/// each other.
 const ANSWER_GAP: Duration = Duration::from_secs(1);
 
-/// How many recent answers are remembered before old ones are let go.
-const ANSWERED_CAP: usize = 256;
+/// The most hosts answered in one window, which is also the most answers
+/// sent in one. A whole LAN fits well inside it; a stream of announcements
+/// with forged sources does not get past it.
+const ANSWERED_CAP: usize = 64;
 
 /// Whether a beacon was sent unasked or in answer to one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,51 @@ pub enum Kind {
     Announce,
     /// Sent back to an announcement. Never answered, so nothing loops.
     Answer,
+}
+
+/// Whether a beacon from `ip` is one this node listens to: loopback, a
+/// private network, or link-local. A beacon finds nodes on the local
+/// network, and a datagram from anywhere else is either misrouted or forged.
+///
+/// Forged is the case that matters. A UDP source address is whatever the
+/// sender wrote, and an announcement is answered at it — so a node that
+/// answered anyone would send its hello at any host on the internet that a
+/// stranger named, several times larger than what asked for it.
+pub fn on_local_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => on_local_network(IpAddr::V4(v4)),
+            None => false,
+        },
+    }
+}
+
+/// Who has been answered lately, which holds answers to one per host per
+/// [`ANSWER_GAP`] and to [`ANSWERED_CAP`] in all.
+///
+/// Keyed by host, not host and port: the port is as freely forged as the
+/// address, and a key that includes it gives a new allowance per port.
+/// When the table is full of hosts still inside their window, nobody new is
+/// answered until one ages out. Making room by forgetting them instead would
+/// hand every one of them a fresh answer, which is the flood the cap exists
+/// to stop.
+#[derive(Debug, Default)]
+struct Answered {
+    at: HashMap<IpAddr, Instant>,
+}
+
+impl Answered {
+    /// Whether `ip` may be answered at `now`, recording it if so.
+    fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.at
+            .retain(|_, at| now.saturating_duration_since(*at) < ANSWER_GAP);
+        if self.at.contains_key(&ip) || self.at.len() >= ANSWERED_CAP {
+            return false;
+        }
+        self.at.insert(ip, now);
+        true
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -160,7 +207,7 @@ pub struct Beacon {
     port: u16,
     announce: Vec<u8>,
     answer: Vec<u8>,
-    answered: HashMap<SocketAddr, Instant>,
+    answered: Answered,
 }
 
 impl Beacon {
@@ -189,7 +236,7 @@ impl Beacon {
             port,
             announce,
             answer,
-            answered: HashMap::new(),
+            answered: Answered::default(),
         })
     }
 
@@ -227,7 +274,8 @@ impl Beacon {
 
     /// Waits up to `timeout` for a beacon from another node and returns who
     /// sent it, answering it if it was an announcement. `None` when nothing
-    /// came, or what came was this node's own beacon or not a beacon.
+    /// came, or what came was this node's own beacon, not a beacon, or from
+    /// off the local network (see [`on_local_network`]).
     pub fn recv(&mut self, timeout: Duration) -> io::Result<Option<Sighting>> {
         self.socket
             .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
@@ -249,6 +297,9 @@ impl Beacon {
             }
             Err(e) => return Err(e),
         };
+        if !on_local_network(from.ip()) {
+            return Ok(None);
+        }
         let Ok((kind, hello)) = decode(&buf[..n]) else {
             return Ok(None);
         };
@@ -282,23 +333,9 @@ impl Beacon {
     }
 
     fn answer_to(&mut self, to: SocketAddr) {
-        let now = Instant::now();
-        if self
-            .answered
-            .get(&to)
-            .is_some_and(|at| now.duration_since(*at) < ANSWER_GAP)
-        {
-            return;
+        if self.answered.allow(to.ip(), Instant::now()) {
+            let _ = self.socket.send_to(&self.answer, to);
         }
-        if self.answered.len() >= ANSWERED_CAP {
-            self.answered
-                .retain(|_, at| now.duration_since(*at) < ANSWER_GAP);
-            if self.answered.len() >= ANSWERED_CAP {
-                self.answered.clear();
-            }
-        }
-        self.answered.insert(to, now);
-        let _ = self.socket.send_to(&self.answer, to);
     }
 }
 
@@ -435,6 +472,54 @@ mod tests {
 
         assert!(a.recv(WAIT).unwrap().is_some());
         assert!(a.recv(BRIEF).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_new_source_port_is_not_a_new_allowance() {
+        let mut b = beacon("node-b");
+        let mut first = beacon("node-a");
+        let mut second = beacon("node-c");
+        first.announce_at(at(&b)).unwrap();
+        second.announce_at(at(&b)).unwrap();
+        assert!(b.recv(WAIT).unwrap().is_some());
+        assert!(b.recv(WAIT).unwrap().is_some());
+
+        // Both came from 127.0.0.1, so only the first is answered.
+        assert!(first.recv(WAIT).unwrap().is_some());
+        assert!(second.recv(BRIEF).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_full_table_refuses_rather_than_forgets() {
+        let mut answered = Answered::default();
+        let start = Instant::now();
+        let host = |i: usize| IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
+        for i in 0..ANSWERED_CAP {
+            assert!(answered.allow(host(i), start));
+        }
+        assert!(!answered.allow(host(ANSWERED_CAP), start));
+        // Nobody already answered gets another one for being crowded out.
+        assert!(!answered.allow(host(0), start));
+
+        let later = start + ANSWER_GAP;
+        assert!(answered.allow(host(ANSWERED_CAP), later));
+        assert!(answered.allow(host(0), later));
+    }
+
+    #[test]
+    fn only_the_local_network_is_heard() {
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.20.10.2",
+            "192.168.1.20",
+            "169.254.7.7",
+        ] {
+            assert!(on_local_network(local.parse().unwrap()), "{local}");
+        }
+        for remote in ["8.8.8.8", "100.64.0.1", "203.0.113.9", "2001:db8::1"] {
+            assert!(!on_local_network(remote.parse().unwrap()), "{remote}");
+        }
     }
 
     #[test]
