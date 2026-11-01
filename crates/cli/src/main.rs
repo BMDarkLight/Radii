@@ -443,11 +443,15 @@ async fn plan_routes(
         // The original key=value line, unchanged: something out there parses it.
         brand::Format::Plain => {
             for route in &results {
-                let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
+                let names = route
+                    .hops
+                    .iter()
+                    .map(|n| brand::untrusted(&n.0))
+                    .collect::<Vec<_>>();
                 println!(
                     "score={:.1} protocol={} path={}",
                     route.score,
-                    route.protocol.0,
+                    brand::untrusted(&route.protocol.0),
                     names.join(" -> ")
                 );
             }
@@ -457,13 +461,17 @@ async fn plan_routes(
                 println!("{}", brand::dim("no route", term));
             }
             for (rank, route) in results.iter().enumerate() {
-                let names = route.hops.iter().map(|n| n.0.as_str()).collect::<Vec<_>>();
+                let names = route
+                    .hops
+                    .iter()
+                    .map(|n| brand::untrusted(&n.0))
+                    .collect::<Vec<_>>();
                 println!(
                     "{} {:>2}  {:>6.1}  {:<8}  {}",
                     brand::reach_glyph(Some(true), term),
                     rank + 1,
                     route.score,
-                    route.protocol.0,
+                    brand::untrusted(&route.protocol.0),
                     names.join(" \u{2192} "),
                 );
             }

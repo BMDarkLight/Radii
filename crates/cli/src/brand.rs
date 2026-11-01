@@ -252,6 +252,28 @@ pub fn literal(text: &str, term: &Term) -> String {
     format!("{style}{text}{style:#}")
 }
 
+/// Text a peer wrote, made safe to put on a terminal.
+///
+/// Node ids, roles, addresses and protocol names reach us from Crawl's
+/// registry, which peers write. Printed raw, a control character in one of
+/// them is an escape sequence the terminal obeys — it can repaint, retitle or
+/// hide output. Control characters are shown escaped instead, so the name is
+/// still legible and still visibly odd.
+pub fn untrusted(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// One of the three reachability colours, applied only if this terminal gets
 /// colour at all.
 pub fn tinted(text: &str, color: anstyle::RgbColor, term: &Term) -> String {
@@ -374,6 +396,17 @@ mod tests {
             !banner.contains('\u{1b}'),
             "no escape sequences without colour"
         );
+    }
+
+    #[test]
+    fn untrusted_text_cannot_reach_the_terminal_as_an_escape() {
+        assert!(matches!(
+            untrusted("node-a"),
+            std::borrow::Cow::Borrowed("node-a")
+        ));
+        let shown = untrusted("evil\u{1b}]0;pwned\u{7}\r\nnode");
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert_eq!(shown, "evil\\u{1b}]0;pwned\\u{7}\\r\\nnode");
     }
 
     #[test]

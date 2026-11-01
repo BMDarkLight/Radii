@@ -21,7 +21,7 @@ use radii_proto::tls::TlsIdentity;
 use radii_proto::{GraphReport, NodeInfo};
 use serde::Serialize;
 
-use crate::brand::{self, Format, Term};
+use crate::brand::{self, untrusted, Format, Term};
 
 /// The whole reply, for `--json`. Mirrors the wire types rather than
 /// inventing a shape, so a reader can follow it back to the protocol.
@@ -171,10 +171,10 @@ fn print_plain(nodes: &[NodeInfo], reports: &[GraphReport]) {
             .join(",");
         println!(
             "node id={} state={} roles={} addrs={}",
-            node.node_id,
+            untrusted(&node.node_id),
             state_label(node_state(&node.node_id, reports)),
-            node.roles.join(","),
-            addrs
+            untrusted(&node.roles.join(",")),
+            untrusted(&addrs)
         );
     }
     for report in reports {
@@ -186,7 +186,11 @@ fn print_plain(nodes: &[NodeInfo], reports: &[GraphReport]) {
             .unwrap_or_else(|| "-".into());
         println!(
             "link from={} target={} protocol={} reachable={} rtt_ms={}",
-            report.from, report.target, report.protocol, report.reachable, rtt
+            untrusted(&report.from),
+            untrusted(&report.target),
+            untrusted(&report.protocol),
+            report.reachable,
+            rtt
         );
     }
 }
@@ -201,28 +205,28 @@ fn print_pretty(nodes: &[NodeInfo], reports: &[GraphReport], term: &Term) {
         println!("{}", brand::heading("Nodes", term));
         let width = nodes
             .iter()
-            .map(|n| n.node_id.chars().count())
+            .map(|n| untrusted(&n.node_id).chars().count())
             .max()
             .unwrap_or(0);
         for node in nodes {
-            let pad = " ".repeat(width.saturating_sub(node.node_id.chars().count()));
+            let pad = " ".repeat(width.saturating_sub(untrusted(&node.node_id).chars().count()));
             let roles = if node.roles.is_empty() {
                 brand::dim("no roles", term)
             } else {
-                node.roles.join(", ")
+                untrusted(&node.roles.join(", ")).into_owned()
             };
             println!(
                 "  {} {}{pad}  {}",
                 brand::reach_glyph(node_state(&node.node_id, reports), term),
-                brand::literal(&node.node_id, term),
+                brand::literal(&untrusted(&node.node_id), term),
                 roles
             );
             for addr in &node.listen_addrs {
                 println!(
                     "    {}  {} {}",
                     " ".repeat(width),
-                    brand::dim(&format!("{}:", addr.role), term),
-                    addr.addr
+                    brand::dim(&format!("{}:", untrusted(&addr.role)), term),
+                    untrusted(&addr.addr)
                 );
             }
         }
@@ -235,12 +239,16 @@ fn print_pretty(nodes: &[NodeInfo], reports: &[GraphReport], term: &Term) {
         println!("{}", brand::heading("Links", term));
         let width = reports
             .iter()
-            .map(|r| r.from.chars().count() + r.target.chars().count())
+            .map(|r| untrusted(&r.from).chars().count() + untrusted(&r.target).chars().count())
             .max()
             .unwrap_or(0)
             + 3;
         for report in reports {
-            let path = format!("{} \u{2192} {}", report.from, report.target);
+            let path = format!(
+                "{} \u{2192} {}",
+                untrusted(&report.from),
+                untrusted(&report.target)
+            );
             let pad = " ".repeat(width.saturating_sub(path.chars().count()));
             let rtt = match report.rtt_ms {
                 Some(ms) => format!("{ms} ms"),
@@ -249,7 +257,7 @@ fn print_pretty(nodes: &[NodeInfo], reports: &[GraphReport], term: &Term) {
             println!(
                 "  {} {path}{pad}  {:<8}  {rtt}",
                 brand::reach_glyph(Some(report.reachable), term),
-                report.protocol,
+                untrusted(&report.protocol),
             );
         }
     }
