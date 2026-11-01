@@ -450,8 +450,9 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<RadiiM
 /// or report relayed through a Head arrives wrapped in `FromHead`, and a
 /// bound enforced only on the direct shape is one an attacker reaches
 /// around by going via a Head — which is exactly the path Head exists to
-/// provide.
-fn validate_message(message: &RadiiMessage) -> Result<()> {
+/// provide. Public so messages that arrive outside a stream frame, like a
+/// LAN beacon's, are held to the same bounds.
+pub fn validate_message(message: &RadiiMessage) -> Result<()> {
     match message {
         RadiiMessage::NodeHello {
             node_id,
