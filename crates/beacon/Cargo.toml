@@ -1,0 +1,15 @@
+[package]
+name = "radii-beacon"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+description = "Radii LAN beacon: find nodes on the local network without a Crawl to ask"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+radii-proto = { path = "../proto" }
+socket2 = { version = "0.6", features = ["all"] }

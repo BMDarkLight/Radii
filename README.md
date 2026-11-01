@@ -58,6 +58,7 @@ crates/
   core/     shared graph/routing types, logging, protocol registry
   proto/    RadiiMessage + length-prefixed framing + mutual TLS
   crawl/    discovery listener
+  beacon/   LAN beacon: find nodes on the local network with no Crawl
   head/     HTTP entry + decision engine + Radii→Crawl bridge
   fetch/    TCP tunnel delivery
   cli/      operator probe + offline planner (`radii`)
@@ -142,6 +143,7 @@ For mutual TLS setup (certificate provisioning, rotation, revocation), see [`doc
 Per-compartment detail lives in:
 
 - [`crates/crawl/README.md`](crates/crawl/README.md)
+- [`crates/beacon/README.md`](crates/beacon/README.md)
 - [`crates/head/README.md`](crates/head/README.md)
 - [`crates/fetch/README.md`](crates/fetch/README.md)
 - [`crates/cli/README.md`](crates/cli/README.md)

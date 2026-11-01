@@ -5,6 +5,7 @@ members = [
   "crates/proto",
   "crates/head",
   "crates/crawl",
+  "crates/beacon",
   "crates/fetch",
   "crates/cli",
   "crates/integration",
