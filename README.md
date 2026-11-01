@@ -2,7 +2,7 @@
 
 A runtime for header-less content delivery. Radii routes traffic over dedicated infrastructure or P2P mesh paths so services stay reachable despite IP churn, NAT, and partial network failure.
 
-**Status:** early foundation — not production-ready. The workspace ships the three-compartment architecture and a minimal working path (discovery, decision, tunnel). Read [`SECURITY.md`](SECURITY.md) before exposing any listener.
+**Status:** early foundation — not production-ready. Latest pre-release: [v0.1.0](https://github.com/BMDarkLight/Radii/releases/tag/v0.1.0) ([changelog](CHANGELOG.md)). The workspace ships the three-compartment architecture and a minimal working path (discovery, decision, tunnel). Read [`SECURITY.md`](SECURITY.md) before exposing any listener.
 
 ## Why Radii
 
@@ -75,7 +75,25 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Release binaries for Linux (x86_64, aarch64, riscv64), macOS, and Windows (x86_64 and aarch64) can be built via the [CD workflow](.github/workflows/cd.yml) (`radii-<target>` artifacts). It's currently manual-only (`workflow_dispatch`) — the project isn't at a release stage yet — rather than triggered automatically on `main` / version tags.
+Release binaries for Linux (x86_64, aarch64, riscv64), macOS, and Windows (x86_64 and aarch64) can be built via the [CD workflow](.github/workflows/cd.yml) (`radii-<target>` artifacts). It's manual-only (`workflow_dispatch`): run it on a release tag and attach what it builds to that tag's GitHub release.
+
+### As a library
+
+The crates aren't published to crates.io. Pin them to a release tag, so an embedding application builds the same Radii everywhere — on CI as well as on a machine with a Radii checkout beside it:
+
+```toml
+[dependencies]
+radii-proto = { git = "https://github.com/BMDarkLight/Radii", tag = "v0.1.0" }
+radii-beacon = { git = "https://github.com/BMDarkLight/Radii", tag = "v0.1.0" }
+```
+
+To build against a local checkout while developing, override the tag rather than editing the dependency:
+
+```toml
+[patch."https://github.com/BMDarkLight/Radii"]
+radii-proto = { path = "../Radii/crates/proto" }
+radii-beacon = { path = "../Radii/crates/beacon" }
+```
 
 ## Quick start
 

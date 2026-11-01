@@ -92,6 +92,8 @@ We will not pursue legal action against researchers who:
 
 Today, **every TCP listener that accepts connections must be treated as an untrusted-input surface**.
 
+The LAN beacon (`radii-beacon`, UDP 7101) sits outside this picture: it is not part of the Crawl/Head/Fetch path, and it is used directly by applications embedding Radii (Wave among them). Every datagram it hears is unauthenticated input from anyone on the local network — see [LAN beacon](#lan-beacon).
+
 ### Adversaries considered
 
 1. **Remote network attacker** who can open TCP connections to exposed binds
@@ -145,7 +147,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | No message signing or anti-replay | An authenticated peer (with or without TLS) can still resend its own old, valid-but-stale reports — mTLS proves who sent a message, not when it was generated |
 | A configured relay peer is still trusted to report its clients' identities honestly | Crawl checks that a `FromHead` claim matches the `client_identity` the Head asserts, but that assertion is the Head's word. A *compromised* Head (one whose private key an attacker holds) can still relay any claim it likes for a client it invents. Relay rights are therefore a trust grant: list only Heads you operate |
 | No authorization on Head HTTP | The decision JSON now lives only at `GET /_radii/decision` rather than being returned on every path, so an operator can firewall exactly one route instead of all of them. That narrows the disclosure; it does not authenticate it, and the endpoint still reveals the backend map to anyone who can reach it |
-| No connection timeouts *outside the relay and proxy paths* | Crawl's listener and Head's Radii bridge still have no deadline on TLS handshakes, idle sessions, or upstream dials — connections that never make progress hold a task and a socket indefinitely. Bounded now: the relay path (`handshake_timeout_ms`, `idle_timeout_ms`), Fetch's candidate dials (`attempt_timeout_ms`), and Head's proxy path (`attempt_timeout_ms`, `response_timeout_ms`) |
+| No connection timeouts *outside the relay and proxy paths* | Crawl's listener, Head's Radii bridge, and Fetch's front tunnel listener (including its static `upstream` dial when `[graph]` is off) still have no deadline on TLS handshakes, idle sessions, or upstream dials — connections that never make progress hold a task and a socket indefinitely. Bounded now: the relay path (`handshake_timeout_ms`, `idle_timeout_ms`), Fetch's candidate dials (`attempt_timeout_ms`), and Head's proxy path (`attempt_timeout_ms`, `response_timeout_ms`) |
 | A relay certificate is a bandwidth grant | With admission by CA membership, issuing a certificate entitles the holder to forwarding capacity, not only to writing graph reports. Narrow with `allow_peers` where that is not intended, and revoke with a `crl` (see [`docs/tls.md`](docs/tls.md)) to withdraw one without rotating the CA. A CRL only affects nodes that load it, and is read at startup — so revocation is as fast as your rollout, not instant |
 | Relays observe traffic patterns | Payloads are opaque to a relay, but it sees volume, timing, and its immediate neighbours. There is no padding and no cover traffic — **this is not anonymity** and must not be described as such |
 | A relay can deny service to a chain it carries | It can stall or drop. It cannot read or impersonate the endpoint. Ranked-candidate retry is the mitigation, not prevention |
@@ -157,6 +159,7 @@ Today, **every TCP listener that accepts connections must be treated as an untru
 | No rate limiting / connection quotas | Easy DoS against Crawl/Head/Fetch, TLS-authenticated or not |
 | Graph state is bounded, but the bounds are the only defence | Crawl's reachability table is keyed (a repeat report replaces rather than appends), capped globally (`MAX_REACHABILITY_ENTRIES` = 16384) and per peer (`MAX_REACHABILITY_ENTRIES_PER_PEER` = 1024), aged out by `node_ttl_ms`, and now bounded in entry *size* as well as count (`MAX_NODE_ID_LEN` = 256, `MAX_PROTOCOL_LEN` = 64, `MAX_NODE_ROLES` = 16) — the count caps alone left `target`/`protocol` unbounded, and `authorized()` constrains only `from`. Planning is capped by `MAX_GRAPH_NODES` / `MAX_GRAPH_LINKS` / `MAX_ROUTE_HOPS` / `MAX_ROUTE_RESULTS`. A peer can still fill its own per-peer share with invented targets, and a graph truncated at a cap means every planner works from a partial view — `GraphSnapshot::dropped_links()` is non-zero when that happens and Head logs it |
 | Crawl's node registry is unbounded and never evicted | `CrawlState::nodes` has no global or per-peer cap, and `node_ttl_ms` only filters expired nodes out of `GraphQuery` replies — nothing removes them from memory. On a plaintext listener a peer can register unlimited distinct node ids and the memory is never reclaimed; mTLS bounds it to one entry per authenticated identity, since `authorized()` requires a hello's `node_id` to match the peer's certificate. Entry size is bounded (see above); entry count is not |
+| Beacon sightings are unauthenticated | Anyone on the local network can send a beacon under any node id, advertising any listener address, and every node's id is broadcast to the whole network. A sighting is a hint to go and look, never proof of identity: an application must confirm a node over an authenticated channel before trusting it, and must not move a known peer to a new address, or send it a credential, on a sighting alone |
 | Fetch is an open TCP tunnel to configured upstream | Misbind + exposure ≈ proxy to internal services |
 | No sandboxing of protocol workers | A memory-safety bug would be process-wide (Rust reduces but does not eliminate risk) |
 | Logs may include client IPs and hosts | Privacy / compliance exposure |
@@ -265,6 +268,16 @@ Item 4 has not landed, and item 3 is incomplete, and TLS itself is opt-in rather
 Reachability reports are keyed, capped globally and per peer, aged out by `node_ttl_ms`, and bounded in entry size — see the graph-state row in the gap table above for the exact constants and what remains.
 
 The **node registry** is the part still unbounded: `CrawlState::nodes` has no cap, and `node_ttl_ms` only hides expired nodes from `GraphQuery` replies rather than removing them. On a plaintext listener a peer can register unlimited distinct node ids permanently. Enable mTLS, which limits a peer to one registry entry (its own authenticated id), or restrict who can reach the listener.
+
+### LAN beacon
+
+The beacon answers an announcement at the datagram's source address, which the sender chooses, so an unguarded answer is a reflector: forge the source and a node sends its hello, larger than the request, at a host of the attacker's choosing. Three bounds keep that from being useful:
+
+- Datagrams from outside loopback, private (RFC 1918), and link-local addresses are dropped before they are parsed, so a node never answers toward the internet even when its beacon port is reachable from it.
+- Answers are limited to one per **host** per second. Keying on host and port, as an earlier version did, gave each forged source port a fresh allowance.
+- At most 64 hosts are answered per second in all. When that table is full, new hosts go unanswered until an entry ages out — it is not cleared to make room, which would hand every host in it another answer.
+
+A beacon also carries no authentication, by design: it finds nodes, it does not vouch for them. See the beacon row in the gap table above.
 
 ### Fetch proxy risk
 
